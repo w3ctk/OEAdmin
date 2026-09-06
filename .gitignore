@@ -1,0 +1,22 @@
+# OEAdmin runtime artifacts (never commit these to the public repo)
+OEAdmin.log
+OEAdmin*.log
+OEAdmin.lck
+*.out
+*.err
+
+# Property-file backups the script makes
+*.properties.bak
+
+# OpenEdge backup / database artifacts, in case anyone runs it in the repo dir
+*.bk
+*.db
+*.d
+
+# Editor / OS cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.vscode/
+.idea/
