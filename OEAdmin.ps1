@@ -606,8 +606,12 @@ function Get-BrokerPorts {
     $curDb = $null; $curPort = $null; $curType = $null
     # flush the current [servergroup.*] block into the map if it carries 4GL.
     $flush = {
-        if ($curDb -and $curPort -and ($curType -eq "4gl" -or $curType -eq "both")) {
-            $dedicated = ($curType -eq "4gl")
+        # Accept the group if it is an explicit 4GL/combined group, OR if it has a
+        # port but no type= line at all.  Older OE / single-default-group installs
+        # (e.g. a lone [servergroup.*.defaultservergroup] with no type=) serve 4GL
+        # clients implicitly, so a typeless port IS the 4GL listener.
+        if ($curDb -and $curPort -and ($curType -eq "4gl" -or $curType -eq "both" -or -not $curType)) {
+            $dedicated = ($curType -eq "4gl")   # only an explicit 4gl group is "dedicated"
             if (-not $ports.ContainsKey($curDb) -or ($dedicated -and -not $isS4gl[$curDb])) {
                 $ports[$curDb]  = $curPort
                 $isS4gl[$curDb] = $dedicated
