@@ -904,6 +904,15 @@ function Get-InstanceArgs {
     param($Item, $ActionFlag)
     # -Remote targets the instance's own AdminServer by name; otherwise localhost.
     $hostName = if ($Remote -eq $true) { $Item.Server } else { "localhost" }
+
+    # OpenEdge 9.1E dbman predates the -host/-port/-database flag syntax; it takes
+    # the database name as a bare positional argument: "dbman <name> -query".
+    if ($Item.Component -eq "Database" -and $Item.OEVersion -like "9.1*") {
+        $a = @($Item.Name, $ActionFlag)
+        if (-not [string]::IsNullOrWhiteSpace($User)) { $a += @("-user",$User) }
+        return $a
+    }
+
     if ($Item.Component -eq "Database") {
         $a = @("-host",$hostName,"-port","$($Item.Port)","-database",$Item.Name,$ActionFlag)
     } else {
@@ -950,8 +959,10 @@ function Test-InstanceRunning {
     if ([string]::IsNullOrWhiteSpace($o)) { return $false }
     switch ($Item.Component) {
         "Database" {
-            if ($o -match '(?im)database is running:\s*Running') { return $true }
-            if ($o -match '(?im)database is running:\s*Not')     { return $false }
+            # 12.x wording: "database is running: Running" / "... Not running"
+            # 9.1E wording: "database is running: true" / "... false"
+            if ($o -match '(?im)database is running:\s*(Running|true|yes)') { return $true }
+            if ($o -match '(?im)database is running:\s*(Not|false|no)')     { return $false }
             if ($o -match '(?i)no such database|not running|does not exist') { return $false }
         }
         "NameServer" {
