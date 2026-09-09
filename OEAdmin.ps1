@@ -35,6 +35,14 @@ You may obtain a copy of the License at
              database NAMING CONVENTION parsers (Parse-App1Database /
              Parse-App2Database) - see "PROPERTY-FILE READERS".
 
+1.1.0 - Added five more -Client launch switches, each appending one "-p" program
+        and MUTUALLY EXCLUSIVE with -Run and each other: -Editor (_edit.p),
+        -AppBuilder (_ab.p), -Desktop (_desk.p), -Dict (_dict.p), -Admin
+        (_admin.p).  -Run still appends the configurable $StartupProgram.  A new
+        Get-ClientRunProgram helper resolves the single program.  Wired into -Menu
+        (a single "Launch into which program?" picker replaces the old startup
+        yes/no prompt).
+
 #>
 
 <#
@@ -160,8 +168,13 @@ Usage examples (all switches shown; App/Site/Env names are placeholders):
     # Launch the App1 client for site-S1 Test
     ./OEAdmin.ps1 -Client -App App1 -Site S1 -Env Test
 
-    # ...and run a startup program on launch
+    # ...and run the startup program on launch (-p $StartupProgram)
     ./OEAdmin.ps1 -Client -App App1 -Site S1 -Env Test -Run
+
+    # ...or launch straight into a Progress tool (mutually exclusive with -Run):
+    # -Editor -p _edit.p, -AppBuilder -p _ab.p, -Desktop -p _desk.p,
+    # -Dict -p _dict.p, -Admin -p _admin.p
+    ./OEAdmin.ps1 -Client -App App1 -Site S1 -Env Test -Editor
 
     # Launch with an explicit ini/pf pair (bare filename is taken from the
     # standard setup subdir; a full path is accepted verbatim)
@@ -328,12 +341,30 @@ param (
     #        word (see Get-App2EnvStem).  Prod/ProdCopy are refused (dev-side tool).
     # The exe is chosen by the target's OpenEdge version (see Resolve-ClientLaunch).
     # Command line (all options space-separated):
-    #   <exe> -ininame <ini> -pf <pf> [ -p <startup program> ]
+    #   <exe> -ininame <ini> -pf <pf> [ -p <program> ]
+    # where the optional "-p <program>" comes from one of the mutually-exclusive
+    # launch switches -Run/-Editor/-AppBuilder/-Desktop/-Dict/-Admin.
     [switch]$Client,
 
     # When set with -Client, append "-p <StartupProgram>" (see $StartupProgram)
     # so the session runs a startup program on launch.
     [switch]$Run,
+
+    # -Editor/-AppBuilder/-Desktop/-Dict/-Admin: launch -Client straight into a
+    # standard Progress tool instead of the startup program, by appending its "-p"
+    # program to the command line:
+    #   -Editor     -> -p _edit.p    (Procedure Editor)
+    #   -AppBuilder -> -p _ab.p      (AppBuilder)
+    #   -Desktop    -> -p _desk.p    (Desktop)
+    #   -Dict       -> -p _dict.p    (Data Dictionary)
+    #   -Admin      -> -p _admin.p   (Data Administration)
+    # These five and -Run are MUTUALLY EXCLUSIVE (at most one may be set); the
+    # winner supplies the single "-p" program on the -Client command line.
+    [switch]$Editor,
+    [switch]$AppBuilder,
+    [switch]$Desktop,
+    [switch]$Dict,
+    [switch]$Admin,
 
     # -Batch: run the Progress client in BATCH (non-interactive) mode.  Same rules
     # as -Client but the command line ends with "-p <program> -b", and the session
@@ -1301,8 +1332,26 @@ function Resolve-ClientLaunch {
     return [PSCustomObject]@{ Exe=$exe; ExeName=$exeName; Ini=$iniPath; Pf=$pfPath; AddPfs=$addPfPaths }
 }
 
+# Decide the single "-p" program to append to a -Client launch, based on which of
+# the mutually-exclusive launch switches is set:
+#   -Run        -> $StartupProgram (your configurable startup .p)
+#   -Editor     -> _edit.p     -AppBuilder -> _ab.p     -Desktop -> _desk.p
+#   -Dict       -> _dict.p     -Admin      -> _admin.p
+# Returns $null when none is set (plain client launch, no -p).
+function Get-ClientRunProgram {
+    if ($Run        -eq $true) { return $StartupProgram }
+    if ($Editor     -eq $true) { return "_edit.p" }
+    if ($AppBuilder -eq $true) { return "_ab.p" }
+    if ($Desktop    -eq $true) { return "_desk.p" }
+    if ($Dict       -eq $true) { return "_dict.p" }
+    if ($Admin      -eq $true) { return "_admin.p" }
+    return $null
+}
+
 # Launch the Progress GUI client for one database target.  Command line (all
-# options space-separated):  <exe> -ininame <ini> -pf <pf> [ -p <StartupProgram> ]
+# options space-separated):  <exe> -ininame <ini> -pf <pf> [ -p <program> ]
+# The optional "-p <program>" comes from Get-ClientRunProgram (the -Run startup
+# program or a -Editor/-AppBuilder/-Desktop/-Dict/-Admin tool).
 # -Ini / -Pf override the auto-derived paths.  In -DryRun the command is printed.
 function Do-Client {
     param($Item)
@@ -1314,7 +1363,9 @@ function Do-Client {
     $cargs = @("-ininame", $L.Ini, "-pf", $L.Pf)
     $dargs = @("-ininame", (Split-Path $L.Ini -Leaf), "-pf", (Split-Path $L.Pf -Leaf))
     foreach ($ap in $L.AddPfs) { $cargs += @("-pf", $ap); $dargs += @("-pf", (Split-Path $ap -Leaf)) }
-    if ($Run -eq $true) { $cargs += @("-p", $StartupProgram); $dargs += @("-p", $StartupProgram) }
+    # -Run / -Editor / -AppBuilder / -Desktop / -Dict / -Admin each add one "-p".
+    $runPgm = Get-ClientRunProgram
+    if ($runPgm) { $cargs += @("-p", $runPgm); $dargs += @("-p", $runPgm) }
 
     $display = "$($L.ExeName) " + ($dargs -join ' ')
     Write-Message ("Client: {0,-43} {1}" -f (& $Label $Item), $L.ExeName) -Fore Cyan
@@ -1648,6 +1699,9 @@ function Invoke-Menu {
     $script:Status=$false; $script:Start=$false; $script:Stop=$false
     $script:Restart=$false; $script:Backup=$false; $script:Restore=$false
     $script:CopyBackup=$false; $script:Client=$false; $script:Batch=$false
+    # Clear the mutually-exclusive -Client launch switches too.
+    $script:Run=$false; $script:Editor=$false; $script:AppBuilder=$false
+    $script:Desktop=$false; $script:Dict=$false; $script:Admin=$false
 
     # App picker (used by most actions).  Apps not installed on this machine are
     # shown red/disabled (unless -Remote); the default is the first valid one.
@@ -1774,7 +1828,25 @@ function Invoke-Menu {
             $app = & $askApp $false; if ($null -eq $app) { return $false }
             $script:App = $app
             if (-not (& $askClientEnv $app)) { return $false }
-            $script:Run = Read-YesNo -Prompt ("Run the startup program (-p {0}) on launch?" -f $StartupProgram) -Default:$false
+            # Launch program: at most one of the mutually-exclusive -p options.
+            $launch = Read-MenuChoice -Title "Launch into which program? (or none)" -Options @(
+                [pscustomobject]@{ Label="None (plain client)";           Value="None";       Valid=$true }
+                [pscustomobject]@{ Label="Startup program ($StartupProgram)"; Value="Run";     Valid=$true }
+                [pscustomobject]@{ Label="Procedure Editor (_edit.p)";     Value="Editor";     Valid=$true }
+                [pscustomobject]@{ Label="AppBuilder (_ab.p)";             Value="AppBuilder"; Valid=$true }
+                [pscustomobject]@{ Label="Desktop (_desk.p)";              Value="Desktop";    Valid=$true }
+                [pscustomobject]@{ Label="Data Dictionary (_dict.p)";      Value="Dict";       Valid=$true }
+                [pscustomobject]@{ Label="Data Administration (_admin.p)"; Value="Admin";      Valid=$true }
+            )
+            if ($null -eq $launch) { return $false }
+            switch ($launch) {
+                "Run"        { $script:Run        = $true }
+                "Editor"     { $script:Editor     = $true }
+                "AppBuilder" { $script:AppBuilder = $true }
+                "Desktop"    { $script:Desktop    = $true }
+                "Dict"       { $script:Dict       = $true }
+                "Admin"      { $script:Admin      = $true }
+            }
             & $askIniPfOverride
         }
 
@@ -1799,7 +1871,12 @@ function Invoke-Menu {
     if ($script:App   -and $script:App   -ne "All") { $parts += "-App $($script:App)" }
     if ($script:Site  -and $script:Site  -ne "All") { $parts += "-Site $($script:Site)" }
     if ($script:Env   -and $script:Env   -ne "All") { $parts += "-Env $($script:Env)" }
-    if ($script:Run   -eq $true)                    { $parts += "-Run" }
+    if ($script:Run        -eq $true)               { $parts += "-Run" }
+    if ($script:Editor     -eq $true)               { $parts += "-Editor" }
+    if ($script:AppBuilder -eq $true)               { $parts += "-AppBuilder" }
+    if ($script:Desktop    -eq $true)               { $parts += "-Desktop" }
+    if ($script:Dict       -eq $true)               { $parts += "-Dict" }
+    if ($script:Admin      -eq $true)               { $parts += "-Admin" }
     if (-not [string]::IsNullOrWhiteSpace($script:Pgm)) { $parts += "-Pgm $($script:Pgm)" }
     if (-not [string]::IsNullOrWhiteSpace($script:Ini)) { $parts += "-Ini `"$($script:Ini)`"" }
     if (-not [string]::IsNullOrWhiteSpace($script:Pf))  { $parts += "-Pf `"$($script:Pf)`"" }
@@ -2136,7 +2213,22 @@ function Test-ClientTargets {
 # CLIENT - launch the Progress GUI client for a single environment.
 if ($Client -eq $true) {
     Write-Section "CLIENT (prowin/prowin32/_progres)"
-    $ct = if (Test-ClientTargets -Tag "Client") {
+
+    # -Run / -Editor / -AppBuilder / -Desktop / -Dict / -Admin each supply the one
+    # "-p" program on the client command line, so at most one may be set.
+    $launchSwitches = @()
+    if ($Run        -eq $true) { $launchSwitches += "-Run" }
+    if ($Editor     -eq $true) { $launchSwitches += "-Editor" }
+    if ($AppBuilder -eq $true) { $launchSwitches += "-AppBuilder" }
+    if ($Desktop    -eq $true) { $launchSwitches += "-Desktop" }
+    if ($Dict       -eq $true) { $launchSwitches += "-Dict" }
+    if ($Admin      -eq $true) { $launchSwitches += "-Admin" }
+    if ($launchSwitches.Count -gt 1) {
+        Write-Message ("  {0} are mutually exclusive - specify at most one." -f ($launchSwitches -join ", ")) -Fore Red
+        $script:OnError = $true
+    }
+
+    $ct = if (($launchSwitches.Count -le 1) -and (Test-ClientTargets -Tag "Client")) {
         @($Targets | Where-Object { $_.Component -eq "Database" })
     } else { @() }
 
