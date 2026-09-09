@@ -904,15 +904,9 @@ function Get-InstanceArgs {
     param($Item, $ActionFlag)
     # -Remote targets the instance's own AdminServer by name; otherwise localhost.
     $hostName = if ($Remote -eq $true) { $Item.Server } else { "localhost" }
-
-    # OpenEdge 9.1E dbman predates the -host/-port/-database flag syntax; it takes
-    # the database name as a bare positional argument: "dbman <name> -query".
-    if ($Item.Component -eq "Database" -and $Item.OEVersion -like "9.1*") {
-        $a = @($Item.Name, $ActionFlag)
-        if (-not [string]::IsNullOrWhiteSpace($User)) { $a += @("-user",$User) }
-        return $a
-    }
-
+    # 9.1E dbman accepts the same -host/-port/-database flags as 12.x, so the flag
+    # form below is used for all versions (required for -Remote). 9.1E only differs
+    # in -query OUTPUT wording, handled in Test-InstanceRunning.
     if ($Item.Component -eq "Database") {
         $a = @("-host",$hostName,"-port","$($Item.Port)","-database",$Item.Name,$ActionFlag)
     } else {
