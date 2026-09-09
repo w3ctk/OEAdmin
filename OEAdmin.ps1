@@ -1093,6 +1093,31 @@ function Invoke-OEUtil {
     return [PSCustomObject]@{ ExitCode=$code; Output=$out.Trim() }
 }
 
+# Delete an existing OpenEdge database (prodel) so a subsequent prorest can
+# recreate it - Progress refuses to prorest over an existing database.  prodel
+# prompts "Are you sure? (y/n)"; we pipe "y" so it completes unattended.  The db
+# argument is the databasename stem (no .db extension), same value probkup/prorest
+# take; the physical file on disk is "<stem>.db".
+function Invoke-OEDelete {
+    param($Item)
+    $exe = Get-OEToolPath $Item.DLC "prodel"
+    if ($DryRun -eq $true) {
+        Write-Message ("  [DRYRUN] DLC={0}  prodel {1}  (auto-answering 'y')" -f $Item.DLC, $Item.DbPath) -Fore DarkGray
+        return [PSCustomObject]@{ ExitCode=0; Output="[dry-run]" }
+    }
+    $prev = $env:DLC; $env:DLC = $Item.DLC
+    try {
+        # Feed "y" to stdin so the "Are you sure?" prompt auto-confirms.
+        $out  = "y" | & $exe $Item.DbPath 2>&1 | Out-String
+        $code = $LASTEXITCODE
+    } catch {
+        $out = $_.Exception.Message; $code = -1
+    } finally {
+        $env:DLC = $prev
+    }
+    return [PSCustomObject]@{ ExitCode=$code; Output=$out.Trim() }
+}
+
 # Online backup of one production database (probkup online <db> <device>).
 function Do-Backup {
     param($Item)
@@ -1100,9 +1125,12 @@ function Do-Backup {
     if (-not $device) { Write-Message ("  Backup: no device mapping for {0}" -f $Item.Name) -Fore Red; return }
     if ($Remote -eq $true) { $device = Convert-ToRemotePath -Server $Item.Server -LocalPath $device }
     Write-Message ("Backup: {0,-43} -> {1}" -f (& $Label $Item), $device) -Fore Cyan
+    Write-Message ("  RUNNING: probkup online {0} {1}  (this can take a while)..." -f $Item.DbPath, $device) -Fore Cyan
     $r = Invoke-OEUtil -Item $Item -Util "probkup" -Arguments @("online", $Item.DbPath, $device)
     if ($r.ExitCode -ne 0 -and $DryRun -ne $true) {
         Write-Message ("  ERROR (exit $($r.ExitCode)): $($r.Output)") -Fore Red; $script:OnError = $true
+    } else {
+        Write-Message ("  COMPLETED: probkup of {0} -> {1}" -f $Item.Name, $device) -Fore Green
     }
 }
 
@@ -1115,9 +1143,29 @@ function Do-Restore {
     if ($Remote -eq $true) { $source = Convert-ToRemotePath -Server $Item.Server -LocalPath $source }
     Write-Message ("Restore: {0,-43} <- {1}" -f (& $Label $Item), $source) -Fore Cyan
     Do-Stop -Item $Item
+    # prorest refuses to overwrite an existing database.  If one is present at the
+    # target ("<DbPath>.db"), delete it first with prodel (auto-answering "y").
+    $dbFile = "$($Item.DbPath).db"
+    if (Test-Path -Path $dbFile -PathType Leaf) {
+        Write-Message ("  RUNNING: prodel {0}  (existing db present, deleting before restore)..." -f $Item.DbPath) -Fore Cyan
+        $d = Invoke-OEDelete -Item $Item
+        if ($d.ExitCode -ne 0 -and $DryRun -ne $true) {
+            Write-Message ("  ERROR deleting existing db (exit $($d.ExitCode)): $($d.Output)") -Fore Red
+            $script:OnError = $true
+            Do-Start -Item $Item
+            return
+        } else {
+            Write-Message ("  COMPLETED: prodel of {0}" -f $Item.Name) -Fore Green
+        }
+    } elseif ($DryRun -eq $true) {
+        Write-Message ("  [DRYRUN] would prodel {0} first if an existing db is present." -f $Item.DbPath) -Fore DarkGray
+    }
+    Write-Message ("  RUNNING: prorest {0} {1}  (this can take a while)..." -f $Item.DbPath, $source) -Fore Cyan
     $r = Invoke-OEUtil -Item $Item -Util "prorest" -Arguments @($Item.DbPath, $source)
     if ($r.ExitCode -ne 0 -and $DryRun -ne $true) {
         Write-Message ("  ERROR (exit $($r.ExitCode)): $($r.Output)") -Fore Red; $script:OnError = $true
+    } else {
+        Write-Message ("  COMPLETED: prorest of {0} <- {1}" -f $Item.Name, $source) -Fore Green
     }
     Do-Start -Item $Item
 }
@@ -1349,11 +1397,13 @@ function Invoke-CopyBackup {
             if ($DryRun -eq $true) {
                 Write-Message ("  [DRYRUN] robocopy {0}" -f ($rc -join ' ')) -Fore DarkGray
             } else {
-                Write-Message ("  robocopy {0}" -f ($rc -join ' ')) -Fore Cyan
+                Write-Message ("  RUNNING: robocopy {0}  (this can take a while)..." -f ($rc -join ' ')) -Fore Cyan
                 $null = & robocopy @rc 2>&1 | Out-String
                 if ($LASTEXITCODE -ge 8) {          # robocopy: exit >=8 is a failure
                     Write-Message ("  robocopy ERROR (exit $LASTEXITCODE) copying from $src") -Fore Red
                     $script:OnError = $true
+                } else {
+                    Write-Message ("  COMPLETED: robocopy from {0} (exit {1})" -f $src, $LASTEXITCODE) -Fore Green
                 }
             }
         } else {
@@ -1365,11 +1415,13 @@ function Invoke-CopyBackup {
             if ($DryRun -eq $true) {
                 Write-Message ("  [DRYRUN] rsync {0}" -f ($rsyncArgs -join ' ')) -Fore DarkGray
             } else {
-                Write-Message ("  rsync {0}" -f ($rsyncArgs -join ' ')) -Fore Cyan
+                Write-Message ("  RUNNING: rsync {0}  (this can take a while)..." -f ($rsyncArgs -join ' ')) -Fore Cyan
                 $null = & rsync @rsyncArgs 2>&1 | Out-String
                 if ($LASTEXITCODE -ne 0) {
                     Write-Message ("  rsync ERROR (exit $LASTEXITCODE) copying from $src") -Fore Red
                     $script:OnError = $true
+                } else {
+                    Write-Message ("  COMPLETED: rsync from {0} (exit {1})" -f $src, $LASTEXITCODE) -Fore Green
                 }
             }
         }
