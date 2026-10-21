@@ -119,10 +119,18 @@ ACTIONS:
                  processes finish exiting (avoids a too-quick-start failure).
     -Backup      probkup online of the selected Prod databases.
                  PRODUCTION servers only (tier guard).
-    -CopyBackup  copy production backups onto the development server.  Scoped by
-                 -App.  DEVELOPMENT servers only (tier guard).
+    -CopyBackup  Push production backups to the dev server's NAMED share
+                 (\\<CopyDestServer>\<BackupShareName>\..., not the admin drive$
+                 share).  RUNS ON THE PRODUCTION server (source is a local path).
+                 A .bk over -SplitThresholdBytes is binary-split into
+                 -SplitSliceBytes slices (progress meter), each slice copied with
+                 retry/backoff and the local slice deleted on success; the dev
+                 side reassembles slices at restore time.  Scoped by -App.
+                 -AsyncCopy pipelines the split and the copy (disk + network
+                 overlap, bounded by -AsyncQueueDepth); default is synchronous.
     -Restore     prorest a staged production backup into the -Env Dev/Test/SBox
                  target (stop -> prorest -> start).  DEVELOPMENT servers only.
+                 If only split slices are staged, reassembles them first.
                  -Site is REQUIRED when an app has multiple sites (see below).
     -Client      Launch the Progress GUI client (prowin/prowin32) for one
                  environment.  See per-app rules under the -Client parameter.
@@ -131,9 +139,10 @@ ACTIONS:
 
 Backup / restore safety model:
     A server Tier (Production vs Development) is attached to every install.
-    -Backup refuses to run on anything but a Production server; -Restore and
-    -CopyBackup refuse to run on anything but a Development server.  This
-    structurally prevents the atypical prod-restore / dev-backup cases.
+    -Backup and -CopyBackup run on a PRODUCTION server (the backups are local
+    there - -CopyBackup splits/pushes them to the dev share); -Restore runs on a
+    DEVELOPMENT server.  This structurally prevents the atypical prod-restore /
+    dev-backup cases.
 
     When an app has more than one site whose production backups all stage onto a
     single dev server, -Restore REQUIRES an explicit -Site so a restore cannot
@@ -331,7 +340,10 @@ param (
     # multi-site app the required -Site picks which production backup to restore.
     [switch]$Restore,
 
-    # Copy production backup files to the development server. DEVELOPMENT SERVERS ONLY.
+    # Push production backups to the dev server's named share, splitting large
+    # .bk files into slices (copied with retry) that the dev side reassembles at
+    # restore time.  MUST RUN ON THE PRODUCTION server (source is a local path).
+    # See the COPY-BACKUP param group for the share/split/retry settings.
     [switch]$CopyBackup,
 
     # Launch the Progress GUI client (prowin/prowin32) for one environment.
@@ -394,14 +406,58 @@ param (
     # App2 backups: <App2BackupBase>/<subdir>/<file>.bk
     $App2BackupBase="/opt/app2/backups",
 
-    ##### ---- CLIENT (-Client) SETUP LOCATIONS  (CHANGE THIS) -----------------
-    # Setup trees hold the INI + PF files, laid out as:
-    #   <SetupDir>/ini/<server>/<stem>.ini
+    ##### ---- COPY-BACKUP (prod -> dev)  (CHANGE THIS) ------------------------
+    # -CopyBackup RUNS ON THE PRODUCTION server and PUSHES backups to the dev
+    # server (rather than running on dev and pulling - a pull of a very large .bk
+    # over a slow link can take many hours).  Big files are binary-split into
+    # slices, the slices are copied to a NAMED share on the dev server (not the
+    # admin drive$ / UNC admin share), then reassembled on the dev side at restore.
+
+    # Dev server that backups are pushed to (the restore target host).
+    $CopyDestServer="dbserver1-dev",
+
+    # NAMED share on the dev server mapping to its backup directory.  The copy
+    # destination is \\<CopyDestServer>\<BackupShareName>\... on Windows (a real
+    # share, NOT the admin drive$ share).  On Linux set this to however you reach
+    # the dev server's backup dir and adjust the destination-root build below.
+    $BackupShareName="backups",
+
+    # Only split a .bk whose size EXCEEDS this (bytes).  Files at/under it copy
+    # whole.  Default 1GB.
+    [long]$SplitThresholdBytes=1GB,
+
+    # Size of each binary slice when splitting (bytes).  Default 1GB.
+    [long]$SplitSliceBytes=1GB,
+
+    # Per-file copy retry policy: on a failed slice/file copy, pause
+    # $CopyRetryDelay seconds and retry, up to $CopyMaxRetries attempts, then flag
+    # an error.  (MaxRetries 0 = try once, no retry.)
+    [int]$CopyMaxRetries=5,
+    [int]$CopyRetryDelay=15,
+
+    # -AsyncCopy: for the LARGE-file (split) path, pipeline the split and the copy
+    # so slice N copies over the network while slice N+1 is still being carved from
+    # disk (disk I/O and network I/O overlap).  A background runspace consumes a
+    # bounded queue of finished slices, copying each (with the same retry/backoff)
+    # and deleting the local slice on success.  Default OFF (the proven synchronous
+    # split-then-copy path runs instead).  Whole-file copies are unaffected.
+    # (Runspace + BlockingCollection work on both Windows PowerShell 5.1 and 7.)
+    [switch]$AsyncCopy,
+
+    # Max finished slices allowed on local disk awaiting copy when -AsyncCopy is on
+    # (bounds scratch: ~ depth * $SplitSliceBytes).  Default 3 => ~3 GB with 1GB
+    # slices.  The splitter blocks once this many are queued.
+    [int]$AsyncQueueDepth=3,
+
+    ##### ---- CLIENT (-Client) SETUP LOCATIONS -------------------------------
+    # The -Client/-Batch setup-tree root (formerly the global $App1SetupDir /
+    # $App2SetupDir params) now lives PER INSTALL in the $Installs table below, as
+    # each row's SetupDir.  This lets the root differ by machine AND OpenEdge
+    # version.  Layout under each root is unchanged:
+    #   <SetupDir>/ini/<server>/<stem>.ini      (App1 stem <App><Env><Site>, e.g.
+    #                                            app1TestS1; App2 stem = env word)
     #   <SetupDir>/userPfs/<server>/<stem>.pf
-    # For App1 the stem is <App><Env><Site> (e.g. app1TestS1); for App2 it is the
-    # env word (see Get-App2EnvStem).
-    $App1SetupDir="/opt/app1/setup",
-    $App2SetupDir="/opt/app2/setup",
+    # CHANGE THIS by editing the SetupDir on each $Installs row.
 
     # Optional explicit overrides for -Client / -Batch.  Pass just the FILENAME
     # (e.g. "app1TestS1.ini"); it is assumed to live in the standard setup
@@ -470,6 +526,12 @@ param (
     #   OEVersion - the OpenEdge version string (matches -OEVersion)
     #   DLC       - the OpenEdge install directory for THIS install
     #   Port      - the AdminServer management port for THIS install
+    #   SetupDir  - root of this install's -Client/-Batch INI/PF tree (INI under
+    #               <SetupDir>/ini/<server>/, PF under <SetupDir>/userPfs/<server>/).
+    #               It lives PER INSTALL (not as one global) because the root can
+    #               differ by machine AND OpenEdge version - e.g. a 12.8 install and
+    #               a 10.2B install on the same box, or a laptop with its tree on a
+    #               different drive.  CHANGE THIS to your setup-tree roots.
     #
     # A single server can host MULTIPLE installs (e.g. two OpenEdge versions side
     # by side on different DLCs and ports) - just add a row for each.
@@ -478,12 +540,12 @@ param (
     # discovered from each install's property files at run time.
     $Installs=@(
         # ---- App1: prod on dbserver1, dev on dbserver1-dev (two OE versions) ----
-        [PSCustomObject]@{ App="App1"; Tier="Production";  Server="dbserver1";     OEVersion="12.8";  DLC="/usr/dlc";     Port=20931 }
-        [PSCustomObject]@{ App="App1"; Tier="Development"; Server="dbserver1-dev"; OEVersion="12.8";  DLC="/usr/dlc";     Port=20931 }
-        [PSCustomObject]@{ App="App1"; Tier="Development"; Server="dbserver1-dev"; OEVersion="10.2B"; DLC="/usr/dlc102b"; Port=20941 }
+        [PSCustomObject]@{ App="App1"; Tier="Production";  Server="dbserver1";     OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; SetupDir="/opt/app1/setup" }
+        [PSCustomObject]@{ App="App1"; Tier="Development"; Server="dbserver1-dev"; OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; SetupDir="/opt/app1/setup" }
+        [PSCustomObject]@{ App="App1"; Tier="Development"; Server="dbserver1-dev"; OEVersion="10.2B"; DLC="/usr/dlc102b"; Port=20941; SetupDir="/opt/app1/setup-102b" }
         # ---- App2: prod on dbserver2, dev on dbserver2-dev ----------------------
-        [PSCustomObject]@{ App="App2"; Tier="Production";  Server="dbserver2";     OEVersion="12.8";  DLC="/usr/dlc";     Port=20931 }
-        [PSCustomObject]@{ App="App2"; Tier="Development"; Server="dbserver2-dev"; OEVersion="12.8";  DLC="/usr/dlc";     Port=20931 }
+        [PSCustomObject]@{ App="App2"; Tier="Production";  Server="dbserver2";     OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; SetupDir="/opt/app2/setup" }
+        [PSCustomObject]@{ App="App2"; Tier="Development"; Server="dbserver2-dev"; OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; SetupDir="/opt/app2/setup" }
     )
 )
 
@@ -494,6 +556,13 @@ param (
 # Seconds to wait after start/stop before re-checking.
 $SleepAfterStart = 15
 $SleepAfterStop  = 5
+
+# Seconds to pause between successive operations on the SAME database within one
+# multi-step sequence (e.g. restore's prodel -> prorest -> start).  Running those
+# back-to-back can race the OS/OpenEdge releasing file handles from the previous
+# step and throw a "database in use" error, so we settle for a few seconds in
+# between.  3-5s is the sweet spot; skipped entirely in -DryRun.
+$SettleDelay = 5
 
 # Error state flags.
 $OnError    = $false
@@ -781,6 +850,7 @@ function Build-Inventory {
                 DbPath    = $dbPath                # physical db path (for probkup/prorest)
                 Port      = $install.Port          # AdminServer port (management)
                 BrokerPort= $brokerPorts[$db.Name.ToLower()]  # 4GL client-connect port (may be $null / a service name)
+                SetupDir  = $install.SetupDir      # -Client/-Batch INI/PF root for THIS install (per machine + version)
                 Manager   = "dbman"
                 DLC       = $itemDLC
                 LogFile   = $dbLogFile
@@ -1178,6 +1248,28 @@ function Do-Restore {
     if (-not $source) { Write-Message ("  Restore: no source mapping for {0}" -f $Item.Name) -Fore Red; return }
     if ($Remote -eq $true) { $source = Convert-ToRemotePath -Server $Item.Server -LocalPath $source }
     Write-Message ("Restore: {0,-43} <- {1}" -f (& $Label $Item), $source) -Fore Cyan
+
+    # If the whole .bk isn't staged but a split/<basename>/ folder of slices is
+    # (left by -CopyBackup for a large backup), reassemble it into the .bk first
+    # so prorest has a normal file to restore from.
+    if (-not (Test-Path -Path $source -PathType Leaf)) {
+        $srcName  = [System.IO.Path]::GetFileName($source)
+        $srcDir   = [System.IO.Path]::GetDirectoryName($source)
+        $splitDir = Join-PathX $srcDir "split" $srcName
+        if (Test-Path -Path $splitDir) {
+            Write-Message ("  Backup not staged whole; reassembling {0} from slices in {1}..." -f $srcName, $splitDir) -Fore Cyan
+            if ($DryRun -eq $true) {
+                Write-Message ("  [DRYRUN] would reassemble {0} from {1} before prorest." -f $srcName, $splitDir) -Fore DarkGray
+            } elseif (Join-BackupFile -SplitFolder $splitDir -OutFile $source) {
+                Remove-Item -Path $splitDir -Recurse -Force -ErrorAction SilentlyContinue   # drop slices once whole
+            } else {
+                Write-Message ("  Restore: could not reassemble {0} - aborting restore." -f $srcName) -Fore Red
+                $script:OnError = $true
+                return
+            }
+        }
+    }
+
     Do-Stop -Item $Item
     # prorest refuses to overwrite an existing database.  If one is present at the
     # target ("<DbPath>.db"), delete it first with prodel (auto-answering "y").
@@ -1192,6 +1284,13 @@ function Do-Restore {
             return
         } else {
             Write-Message ("  COMPLETED: prodel of {0}" -f $Item.Name) -Fore Green
+            # Settle after prodel so the OS/OpenEdge finishes releasing the
+            # deleted db's file handles before prorest recreates it; otherwise a
+            # back-to-back prorest can hit a "database in use" error.
+            if ($DryRun -ne $true -and $SettleDelay -gt 0) {
+                Write-Message ("  waiting {0}s after prodel (settling)" -f $SettleDelay) -Fore Yellow
+                Start-Sleep -Seconds $SettleDelay
+            }
         }
     } elseif ($DryRun -eq $true) {
         Write-Message ("  [DRYRUN] would prodel {0} first if an existing db is present." -f $Item.DbPath) -Fore DarkGray
@@ -1202,6 +1301,13 @@ function Do-Restore {
         Write-Message ("  ERROR (exit $($r.ExitCode)): $($r.Output)") -Fore Red; $script:OnError = $true
     } else {
         Write-Message ("  COMPLETED: prorest of {0} <- {1}" -f $Item.Name, $source) -Fore Green
+    }
+    # Settle after prorest so the restored db's file handles are fully released
+    # before dbman -start opens it; a too-quick start can otherwise hit a
+    # "database in use" error.
+    if ($DryRun -ne $true -and $SettleDelay -gt 0) {
+        Write-Message ("  waiting {0}s after prorest (settling)" -f $SettleDelay) -Fore Yellow
+        Start-Sleep -Seconds $SettleDelay
     }
     Do-Start -Item $Item
 }
@@ -1228,16 +1334,19 @@ function Get-App2EnvStem {
 #   App2 -> <env>.ini              (e.g. development.ini) - env word, no site
 function Get-ClientIni {
     param($Item)
+    # Setup root comes from the install this item belongs to (per machine + version).
+    $root = $Item.SetupDir
+    if ([string]::IsNullOrWhiteSpace($root)) { return $null }
     if ($Item.App -eq "App2") {
         $stem = Get-App2EnvStem -Env $Item.Env
         if (-not $stem) { return $null }
-        $p = Join-PathX $App2SetupDir "ini" $Item.Server ("$stem.ini")
+        $p = Join-PathX $root "ini" $Item.Server ("$stem.ini")
     }
     else {
         # App1: needs a resolved Env + Site.
         if ([string]::IsNullOrWhiteSpace($Item.Env) -or [string]::IsNullOrWhiteSpace($Item.Site)) { return $null }
         $file = "{0}{1}{2}.ini" -f $Item.App, $Item.Env, $Item.Site
-        $p = Join-PathX $App1SetupDir "ini" $Item.Server $file
+        $p = Join-PathX $root "ini" $Item.Server $file
     }
     if ($Remote -eq $true) { return (Convert-ToRemotePath -Server $Item.Server -LocalPath $p) }
     return $p
@@ -1247,15 +1356,18 @@ function Get-ClientIni {
 # <SetupDir>/userPfs/<server>/; stem as above (App1 <App><Env><Site>, App2 env word).
 function Get-ClientPf {
     param($Item)
+    # Setup root comes from the install this item belongs to (per machine + version).
+    $root = $Item.SetupDir
+    if ([string]::IsNullOrWhiteSpace($root)) { return $null }
     if ($Item.App -eq "App2") {
         $stem = Get-App2EnvStem -Env $Item.Env
         if (-not $stem) { return $null }
-        $p = Join-PathX $App2SetupDir "userPfs" $Item.Server ("$stem.pf")
+        $p = Join-PathX $root "userPfs" $Item.Server ("$stem.pf")
     }
     else {
         if ([string]::IsNullOrWhiteSpace($Item.Env) -or [string]::IsNullOrWhiteSpace($Item.Site)) { return $null }
         $file = "{0}{1}{2}.pf" -f $Item.App, $Item.Env, $Item.Site
-        $p = Join-PathX $App1SetupDir "userPfs" $Item.Server $file
+        $p = Join-PathX $root "userPfs" $Item.Server $file
     }
     if ($Remote -eq $true) { return (Convert-ToRemotePath -Server $Item.Server -LocalPath $p) }
     return $p
@@ -1270,7 +1382,10 @@ function Resolve-ClientFileArg {
     param($Value, $Item, [ValidateSet("ini","userPfs")] $SubDir)
     if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
     if ($Value -match '[\\/]') { return $Value }
-    $root = if ($Item.App -eq "App2") { $App2SetupDir } else { $App1SetupDir }
+    # Bare filename -> place it in the standard setup subdirectory for this item's
+    # install (SetupDir comes from the $Installs row, per machine + version).
+    $root = $Item.SetupDir
+    if ([string]::IsNullOrWhiteSpace($root)) { return $null }
     $p = Join-PathX $root $SubDir $Item.Server $Value
     if ($Remote -eq $true) { return (Convert-ToRemotePath -Server $Item.Server -LocalPath $p) }
     return $p
@@ -1431,55 +1546,376 @@ function Do-Batch {
     }
 }
 
-# Copy production backups onto a development server.  Sources are the
-# Production-tier installs of the same app.  On Windows this uses robocopy; on
-# Linux it falls back to rsync (or cp) - CHANGE THIS if you prefer a different
-# tool or a pull-over-ssh approach.  App1 backups live in a flat dir; App2
-# backups live in per-role subdirs (recurse).
+# ---- Binary file split / join (for large-backup copy) ------------------------
+# Split a big .bk into fixed-size slices so each piece copies independently (and
+# a failed piece can be retried) instead of restarting a multi-hour whole-file
+# copy.  Slices are "<basename>.<NNNN>.part" (zero-padded so a lexical sort =
+# numeric order); a "<basename>.split.manifest" records the original name, size,
+# slice size and part count so the dev side can reassemble + sanity-check.
+
+# Binary-split $SourceFile into $SliceBytes slices under $OutFolder, writing a
+# manifest.  Returns $true on success.  Shows a byte-based percent meter.
+function Split-BackupFile {
+    param(
+        [parameter(Mandatory=$true)] $SourceFile,
+        [parameter(Mandatory=$true)] $OutFolder,
+        [long]$SliceBytes = 1GB
+    )
+    if (-not (Test-Path -Path $SourceFile -PathType Leaf)) {
+        Write-Message ("  Split: source not found: {0}" -f $SourceFile) -Fore Red; return $false
+    }
+    if (-not (Test-Path -Path $OutFolder)) { $null = New-Item -ItemType Directory -Path $OutFolder -Force }
+    $baseName  = [System.IO.Path]::GetFileName($SourceFile)
+    $totalSize = (Get-Item -LiteralPath $SourceFile).Length
+    $reader = [System.IO.FileStream]::new($SourceFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read)
+    try {
+        $buffer  = New-Object byte[] $SliceBytes
+        $index   = 0
+        $written = [long]0
+        while ($true) {
+            $bytesRead = $reader.Read($buffer, 0, $buffer.Length)
+            if ($bytesRead -le 0) { break }
+            $partPath = Join-PathX $OutFolder ("{0}.{1:D4}.part" -f $baseName, $index)
+            $writer = [System.IO.FileStream]::new($partPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+            try { $writer.Write($buffer, 0, $bytesRead) } finally { $writer.Dispose() }
+            $written += $bytesRead
+            $index++
+            $pct = if ($totalSize -gt 0) { [int](($written * 100) / $totalSize) } else { 100 }
+            Write-Progress -Activity ("Splitting {0}" -f $baseName) `
+                -Status ("part {0} - {1:N0} / {2:N0} bytes ({3}%)" -f $index, $written, $totalSize, $pct) `
+                -PercentComplete $pct
+        }
+        Write-Progress -Activity ("Splitting {0}" -f $baseName) -Completed
+    } finally {
+        $reader.Dispose()
+    }
+    $manifest = @(
+        "OriginalName=$baseName"
+        "OriginalSize=$totalSize"
+        "SliceBytes=$SliceBytes"
+        "PartCount=$index"
+    )
+    Set-Content -Path (Join-PathX $OutFolder ("$baseName.split.manifest")) -Value $manifest -Encoding ascii
+    Write-Message ("  Split: {0} -> {1} slice(s) in {2}" -f $baseName, $index, $OutFolder) -Fore Green
+    return $true
+}
+
+# Reassemble the slices in $SplitFolder back into $OutFile using the manifest.
+# Returns $true on success.  Shows a byte-based percent meter.  Used by -Restore
+# on the dev side when it finds slices instead of a whole .bk.
+function Join-BackupFile {
+    param(
+        [parameter(Mandatory=$true)] $SplitFolder,
+        [parameter(Mandatory=$true)] $OutFile
+    )
+    $baseName     = [System.IO.Path]::GetFileName($OutFile)
+    $manifestPath = Join-PathX $SplitFolder ("$baseName.split.manifest")
+    $expectedSize = $null; $expectedParts = $null
+    if (Test-Path -Path $manifestPath -PathType Leaf) {
+        foreach ($line in (Get-Content -Path $manifestPath)) {
+            if ($line -match '^\s*OriginalSize\s*=\s*(\d+)\s*$') { $expectedSize  = [long]$Matches[1] }
+            if ($line -match '^\s*PartCount\s*=\s*(\d+)\s*$')    { $expectedParts = [int]$Matches[1] }
+        }
+    }
+    $parts = @(Get-ChildItem -Path $SplitFolder -Filter ("$baseName.*.part") |
+               Sort-Object {
+                   if ($_.Name -match '\.(\d+)\.part$') { [int]$Matches[1] } else { $_.Name }
+               })
+    if ($parts.Count -eq 0) {
+        Write-Message ("  Join: no slices found for {0} in {1}" -f $baseName, $SplitFolder) -Fore Red; return $false
+    }
+    if ($null -ne $expectedParts -and $parts.Count -ne $expectedParts) {
+        Write-Message ("  Join: part count mismatch for {0} (found {1}, manifest says {2}) - aborting" -f `
+            $baseName, $parts.Count, $expectedParts) -Fore Red
+        $script:OnError = $true; return $false
+    }
+    $totalSize = ($parts | Measure-Object -Property Length -Sum).Sum
+    $writer = [System.IO.FileStream]::new($OutFile, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+    try {
+        $written = [long]0
+        foreach ($file in $parts) {
+            $reader = [System.IO.FileStream]::new($file.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read)
+            try { $reader.CopyTo($writer) } finally { $reader.Dispose() }
+            $written += $file.Length
+            $pct = if ($totalSize -gt 0) { [int](($written * 100) / $totalSize) } else { 100 }
+            Write-Progress -Activity ("Reassembling {0}" -f $baseName) `
+                -Status ("{0:N0} / {1:N0} bytes ({2}%)" -f $written, $totalSize, $pct) `
+                -PercentComplete $pct
+        }
+        Write-Progress -Activity ("Reassembling {0}" -f $baseName) -Completed
+    } finally {
+        $writer.Dispose()
+    }
+    if ($null -ne $expectedSize -and (Get-Item -LiteralPath $OutFile).Length -ne $expectedSize) {
+        Write-Message ("  Join: size mismatch for {0} (got {1}, manifest says {2})" -f `
+            $baseName, (Get-Item -LiteralPath $OutFile).Length, $expectedSize) -Fore Red
+        $script:OnError = $true; return $false
+    }
+    Write-Message ("  Join: reassembled {0} from {1} slice(s)" -f $baseName, $parts.Count) -Fore Green
+    return $true
+}
+
+# Copy one file with retry/backoff.  On failure, waits $CopyRetryDelay seconds and
+# retries up to $CopyMaxRetries times, then flags OnError and returns $false.
+function Copy-FileWithRetry {
+    param(
+        [parameter(Mandatory=$true)] $SourcePath,
+        [parameter(Mandatory=$true)] $DestPath
+    )
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        try {
+            Copy-Item -LiteralPath $SourcePath -Destination $DestPath -Force -ErrorAction Stop
+            return $true
+        } catch {
+            if ($attempt -gt $CopyMaxRetries) {
+                Write-Message ("  Copy FAILED after {0} attempt(s): {1} -> {2}: {3}" -f `
+                    $attempt, $SourcePath, $DestPath, $_.Exception.Message) -Fore Red
+                $script:OnError = $true
+                return $false
+            }
+            Write-Message ("  Copy attempt {0} failed ({1}); retrying in {2}s..." -f `
+                $attempt, $_.Exception.Message, $CopyRetryDelay) -Fore Yellow
+            if ($CopyRetryDelay -gt 0) { Start-Sleep -Seconds $CopyRetryDelay }
+        }
+    }
+}
+
+# PIPELINED (async) split+copy of ONE large .bk (used when -AsyncCopy is set).
+# The split (local disk I/O) and the slice copy (network I/O) overlap: a
+# background runspace consumes slices from a BOUNDED queue (depth $AsyncQueueDepth)
+# while this thread keeps carving the next slice.  Each slice is copied with the
+# same retry/backoff, then its local copy is deleted; the consumer pushes a result
+# record back so this thread can draw progress and detect a failure.  Writes the
+# .split.manifest and copies it last once all slices are in.  Returns $true on OK.
+#
+# Boundary notes: the consumer runspace can't see this script's functions or
+# $script:OnError, so the copy+retry logic is passed in as a scriptblock and
+# failures are surfaced via the result queue (this thread sets $script:OnError).
+# Runspace + BlockingCollection are full-language and work on 5.1 and 7.
+function Invoke-SplitCopyAsync {
+    param(
+        [parameter(Mandatory=$true)] $SourceFile,
+        [parameter(Mandatory=$true)] $LocalSplitFolder,
+        [parameter(Mandatory=$true)] $DestSplitFolder,
+        [long]$SliceBytes = 1GB,
+        [int]$QueueDepth  = 3
+    )
+    if (-not (Test-Path -Path $SourceFile -PathType Leaf)) {
+        Write-Message ("  AsyncCopy: source not found: {0}" -f $SourceFile) -Fore Red; $script:OnError = $true; return $false
+    }
+    if (Test-Path -Path $LocalSplitFolder) { Remove-Item -Path $LocalSplitFolder -Recurse -Force }
+    $null = New-Item -ItemType Directory -Path $LocalSplitFolder -Force
+    if (-not (Test-Path -Path $DestSplitFolder)) { $null = New-Item -ItemType Directory -Path $DestSplitFolder -Force }
+
+    $baseName  = [System.IO.Path]::GetFileName($SourceFile)
+    $totalSize = (Get-Item -LiteralPath $SourceFile).Length
+
+    # Bounded work queue (producer blocks when QueueDepth slices are outstanding,
+    # which caps local scratch) and an unbounded result queue (consumer -> us).
+    $workQ   = [System.Collections.Concurrent.BlockingCollection[object]]::new($QueueDepth)
+    $resultQ = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+
+    # The consumer runspace: pull {Src;Dst} items, copy with retry, delete local
+    # slice on success, push a result record.  Self-contained (no script funcs).
+    $consumer = {
+        param($workQ, $resultQ, $maxRetries, $retryDelay)
+        foreach ($job in $workQ.GetConsumingEnumerable()) {
+            $attempt = 0; $ok = $false; $err = $null
+            while ($true) {
+                $attempt++
+                try {
+                    Copy-Item -LiteralPath $job.Src -Destination $job.Dst -Force -ErrorAction Stop
+                    $ok = $true; break
+                } catch {
+                    $err = $_.Exception.Message
+                    if ($attempt -gt $maxRetries) { break }
+                    if ($retryDelay -gt 0) { Start-Sleep -Seconds $retryDelay }
+                }
+            }
+            if ($ok) { Remove-Item -LiteralPath $job.Src -Force -ErrorAction SilentlyContinue }
+            $resultQ.Enqueue([PSCustomObject]@{ Name=[System.IO.Path]::GetFileName($job.Src); Ok=$ok; Attempts=$attempt; Error=$err })
+        }
+    }
+
+    $rs = [RunspaceFactory]::CreateRunspace(); $rs.Open()
+    $ps = [PowerShell]::Create(); $ps.Runspace = $rs
+    [void]$ps.AddScript($consumer).AddArgument($workQ).AddArgument($resultQ).AddArgument($CopyMaxRetries).AddArgument($CopyRetryDelay)
+    $async = $ps.BeginInvoke()
+
+    $drain = {
+        $item = $null
+        while ($resultQ.TryDequeue([ref]$item)) {
+            if (-not $item.Ok) {
+                $script:failedName = $item.Name; $script:failedErr = $item.Error; $script:asyncFailed = $true
+            } else {
+                $script:asyncCopied++
+            }
+        }
+    }
+    $script:asyncCopied = 0; $script:asyncFailed = $false; $script:failedName = $null; $script:failedErr = $null
+
+    # Producer: carve slices, enqueue each.  Add blocks when the queue is full.
+    $reader = [System.IO.FileStream]::new($SourceFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read)
+    $index = 0; $written = [long]0
+    try {
+        $buffer = New-Object byte[] $SliceBytes
+        while (-not $script:asyncFailed) {
+            $bytesRead = $reader.Read($buffer, 0, $buffer.Length)
+            if ($bytesRead -le 0) { break }
+            $partName = ("{0}.{1:D4}.part" -f $baseName, $index)
+            $localPart = Join-PathX $LocalSplitFolder $partName
+            $writer = [System.IO.FileStream]::new($localPart, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+            try { $writer.Write($buffer, 0, $bytesRead) } finally { $writer.Dispose() }
+            $written += $bytesRead
+            $index++
+            $workQ.Add([PSCustomObject]@{ Src=$localPart; Dst=(Join-PathX $DestSplitFolder $partName) })
+            $pct = if ($totalSize -gt 0) { [int](($written * 100) / $totalSize) } else { 100 }
+            Write-Progress -Id 1 -Activity ("Splitting {0}" -f $baseName) `
+                -Status ("carved {0} slice(s) - {1:N0}/{2:N0} bytes ({3}%)" -f $index, $written, $totalSize, $pct) `
+                -PercentComplete $pct
+            & $drain
+            Write-Progress -Id 2 -Activity ("Copying slices of {0}" -f $baseName) `
+                -Status ("{0}/{1} copied" -f $script:asyncCopied, $index)
+        }
+    } finally {
+        $reader.Dispose()
+        $workQ.CompleteAdding()
+    }
+
+    while (-not $async.IsCompleted) {
+        & $drain
+        $copyPct = if ($index -gt 0) { [int](($script:asyncCopied * 100) / $index) } else { 100 }
+        Write-Progress -Id 2 -Activity ("Copying slices of {0}" -f $baseName) `
+            -Status ("{0}/{1} copied" -f $script:asyncCopied, $index) -PercentComplete $copyPct
+        Start-Sleep -Milliseconds 300
+    }
+    & $drain
+    try { $ps.EndInvoke($async) } catch { }
+    $ps.Dispose(); $rs.Close(); $rs.Dispose()
+    Write-Progress -Id 1 -Activity ("Splitting {0}" -f $baseName) -Completed
+    Write-Progress -Id 2 -Activity ("Copying slices of {0}" -f $baseName) -Completed
+
+    if ($script:asyncFailed) {
+        Write-Message ("  AsyncCopy FAILED on slice {0}: {1} - left local slices in {2} for retry" -f `
+            $script:failedName, $script:failedErr, $LocalSplitFolder) -Fore Red
+        $script:OnError = $true
+        return $false
+    }
+
+    $manifest = @(
+        "OriginalName=$baseName"
+        "OriginalSize=$totalSize"
+        "SliceBytes=$SliceBytes"
+        "PartCount=$index"
+    )
+    $localManifest = Join-PathX $LocalSplitFolder ("$baseName.split.manifest")
+    Set-Content -Path $localManifest -Value $manifest -Encoding ascii
+    if (-not (Copy-FileWithRetry -SourcePath $localManifest -DestPath (Join-PathX $DestSplitFolder ("$baseName.split.manifest")))) {
+        return $false
+    }
+    Remove-Item -Path $LocalSplitFolder -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Message ("  COMPLETED (async): {0} ({1} slice(s)) -> {2}" -f $baseName, $script:asyncCopied, $DestSplitFolder) -Fore Green
+    return $true
+}
+
+# Copy production backups to the dev server.  MUST RUN ON THE PRODUCTION server:
+# the source is a plain LOCAL path (not UNC); the destination is the dev server's
+# NAMED share \\<CopyDestServer>\<BackupShareName>\... (not the admin drive$
+# share).  A .bk larger than $SplitThresholdBytes is binary-split into
+# $SplitSliceBytes slices (progress meter), each slice copied with retry/backoff;
+# the local slice is deleted as soon as it lands.  The dev side reassembles slices
+# at restore time (see Do-Restore / Join-BackupFile).  Files at/under the
+# threshold copy whole (same retry logic).  App1 backups live in a flat dir; App2
+# backups live in per-role subdirs (the subdir path is preserved on the dest).
+#
+# CHANGE THIS: the $destRoot build below uses the Windows "\\server\share" UNC
+# form.  On Linux, change it to however you reach the dev server's backup dir
+# (NFS/autofs mount, user@host:path over scp/rsync, etc.).
 function Invoke-CopyBackup {
-    param($DevServer, $App)
-    $dir     = if ($App -eq "App1") { $App1BackupDir } else { $App2BackupBase }
-    $recurse = ($App -eq "App2")
-    $sources = @($Installs | Where-Object { $_.App -eq $App -and $_.Tier -eq "Production" } |
-                Select-Object -ExpandProperty Server -Unique)
-    if (-not $sources) { Write-Message "  No production source servers for $App." -Fore Yellow; return }
-    foreach ($src in $sources) {
-        $srcRemote = Convert-ToRemotePath -Server $src       -LocalPath $dir
-        $dstRemote = Convert-ToRemotePath -Server $DevServer -LocalPath $dir
-        if ($IsWindowsHost) {
-            $rc = @($srcRemote, $dstRemote, "*.bk")
-            if ($recurse) { $rc += "/S" }
-            $rc += @("/Z","/J")
+    param($App)
+    $srcDir = if ($App -eq "App1") { $App1BackupDir } else { $App2BackupBase }
+    if (-not (Test-Path -Path $srcDir)) {
+        Write-Message ("  CopyBackup: source dir not found on this (production) server: {0}" -f $srcDir) -Fore Red
+        $script:OnError = $true; return
+    }
+    # Destination root on the dev server's NAMED share (NOT the admin drive$).
+    $destRoot = "\\{0}\{1}" -f $CopyDestServer, $BackupShareName.TrimStart('\')
+    Write-Message ("Copy {0} backups: {1} -> {2}" -f $App, $srcDir, $destRoot) -Fore Cyan
+
+    $bkFiles = @(Get-ChildItem -Path $srcDir -Filter "*.bk" -File -Recurse)
+    if ($bkFiles.Count -eq 0) { Write-Message ("  No .bk files under {0}." -f $srcDir) -Fore Yellow; return }
+
+    foreach ($bk in $bkFiles) {
+        # Preserve any subdir structure (App2 per-role dirs) under the dest root.
+        $relDir  = $bk.DirectoryName.Substring($srcDir.TrimEnd('/','\').Length).Trim('/','\')
+        $destDir = if ($relDir) { Join-PathX $destRoot $relDir } else { $destRoot }
+
+        if ($bk.Length -le $SplitThresholdBytes) {
+            # Small enough: copy the whole file with retry.
+            $destFile = Join-PathX $destDir $bk.Name
+            Write-Message ("  Copy whole: {0} ({1:N0} bytes) -> {2}" -f $bk.Name, $bk.Length, $destDir) -Fore Cyan
             if ($DryRun -eq $true) {
-                Write-Message ("  [DRYRUN] robocopy {0}" -f ($rc -join ' ')) -Fore DarkGray
-            } else {
-                Write-Message ("  RUNNING: robocopy {0}  (this can take a while)..." -f ($rc -join ' ')) -Fore Cyan
-                $null = & robocopy @rc 2>&1 | Out-String
-                if ($LASTEXITCODE -ge 8) {          # robocopy: exit >=8 is a failure
-                    Write-Message ("  robocopy ERROR (exit $LASTEXITCODE) copying from $src") -Fore Red
-                    $script:OnError = $true
-                } else {
-                    Write-Message ("  COMPLETED: robocopy from {0} (exit {1})" -f $src, $LASTEXITCODE) -Fore Green
-                }
+                Write-Message ("  [DRYRUN] copy {0} -> {1}" -f $bk.FullName, $destFile) -Fore DarkGray
+                continue
             }
+            if (-not (Test-Path -Path $destDir)) { $null = New-Item -ItemType Directory -Path $destDir -Force }
+            if (Copy-FileWithRetry -SourcePath $bk.FullName -DestPath $destFile) {
+                Write-Message ("  COMPLETED: {0}" -f $bk.Name) -Fore Green
+            }
+            continue
+        }
+
+        # Large file: split locally, copy slices to <destDir>/split/<basename>/,
+        # then delete the local slices.
+        $localSplit = Join-PathX $bk.DirectoryName "split" $bk.Name
+        $destSplit  = Join-PathX $destDir "split" $bk.Name
+        $mode = if ($AsyncCopy -eq $true) { "async (pipelined split+copy, queue depth $AsyncQueueDepth)" } else { "sync (split then copy)" }
+        Write-Message ("  Large ({0:N0} bytes > {1:N0}); {2}; slices {3:N0} bytes" -f `
+            $bk.Length, $SplitThresholdBytes, $mode, $SplitSliceBytes) -Fore Cyan
+        if ($DryRun -eq $true) {
+            Write-Message ("  [DRYRUN] split {0} -> {1}, copy slices -> {2}, then delete local slices." -f `
+                $bk.FullName, $localSplit, $destSplit) -Fore DarkGray
+            continue
+        }
+
+        # -AsyncCopy: pipeline split + copy (disk and network overlap).  Does its
+        # own split/copy/cleanup/manifest and reports via OnError on failure.
+        if ($AsyncCopy -eq $true) {
+            [void](Invoke-SplitCopyAsync -SourceFile $bk.FullName -LocalSplitFolder $localSplit `
+                -DestSplitFolder $destSplit -SliceBytes $SplitSliceBytes -QueueDepth $AsyncQueueDepth)
+            continue
+        }
+
+        # ---- synchronous path: split fully, then copy each slice ----
+        if (Test-Path -Path $localSplit) { Remove-Item -Path $localSplit -Recurse -Force }
+        if (-not (Split-BackupFile -SourceFile $bk.FullName -OutFolder $localSplit -SliceBytes $SplitSliceBytes)) {
+            continue
+        }
+        if (-not (Test-Path -Path $destSplit)) { $null = New-Item -ItemType Directory -Path $destSplit -Force }
+
+        $slices = @(Get-ChildItem -Path $localSplit -File)
+        $copied = 0; $ok = $true
+        foreach ($s in $slices) {
+            $destFile = Join-PathX $destSplit $s.Name
+            if (Copy-FileWithRetry -SourcePath $s.FullName -DestPath $destFile) {
+                $copied++
+                Remove-Item -LiteralPath $s.FullName -Force -ErrorAction SilentlyContinue   # cleanup ASAP
+                Write-Progress -Activity ("Copying slices of {0}" -f $bk.Name) `
+                    -Status ("{0} / {1} slice(s)" -f $copied, $slices.Count) `
+                    -PercentComplete ([int](($copied * 100) / $slices.Count))
+            } else {
+                $ok = $false; break
+            }
+        }
+        Write-Progress -Activity ("Copying slices of {0}" -f $bk.Name) -Completed
+
+        if ($ok) {
+            Remove-Item -Path $localSplit -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Message ("  COMPLETED: {0} ({1} slice(s)) -> {2}" -f $bk.Name, $copied, $destSplit) -Fore Green
         } else {
-            # Linux: rsync the .bk files.  Adjust the source/dest to however you
-            # reach the two servers (local mount, user@host:path over ssh, ...).
-            $rsyncArgs = @("-a")
-            if ($recurse) { $rsyncArgs += "-r" }
-            $rsyncArgs += @("--include=*/","--include=*.bk","--exclude=*", ($srcRemote.TrimEnd('/') + "/"), ($dstRemote.TrimEnd('/') + "/"))
-            if ($DryRun -eq $true) {
-                Write-Message ("  [DRYRUN] rsync {0}" -f ($rsyncArgs -join ' ')) -Fore DarkGray
-            } else {
-                Write-Message ("  RUNNING: rsync {0}  (this can take a while)..." -f ($rsyncArgs -join ' ')) -Fore Cyan
-                $null = & rsync @rsyncArgs 2>&1 | Out-String
-                if ($LASTEXITCODE -ne 0) {
-                    Write-Message ("  rsync ERROR (exit $LASTEXITCODE) copying from $src") -Fore Red
-                    $script:OnError = $true
-                } else {
-                    Write-Message ("  COMPLETED: rsync from {0} (exit {1})" -f $src, $LASTEXITCODE) -Fore Green
-                }
-            }
+            Write-Message ("  INCOMPLETE: {0} - left local slices in {1} for retry" -f $bk.Name, $localSplit) -Fore Red
         }
     }
 }
@@ -1688,7 +2124,7 @@ function Invoke-Menu {
         [pscustomobject]@{ Label="Restart - stop then start instances";        Value="Restart" }
         [pscustomobject]@{ Label="Backup  - probkup online (PROD servers)";    Value="Backup" }
         [pscustomobject]@{ Label="Restore - prorest prod backup (DEV servers)";Value="Restore" }
-        [pscustomobject]@{ Label="CopyBackup - copy prod backups -> dev";      Value="CopyBackup" }
+        [pscustomobject]@{ Label="CopyBackup - split+push prod backups -> dev (run on PROD)"; Value="CopyBackup" }
         [pscustomobject]@{ Label="Client  - launch Progress GUI client";       Value="Client" }
         [pscustomobject]@{ Label="Batch   - run a Progress program in batch";  Value="Batch" }
     )
@@ -1699,6 +2135,7 @@ function Invoke-Menu {
     $script:Status=$false; $script:Start=$false; $script:Stop=$false
     $script:Restart=$false; $script:Backup=$false; $script:Restore=$false
     $script:CopyBackup=$false; $script:Client=$false; $script:Batch=$false
+    $script:AsyncCopy=$false
     # Clear the mutually-exclusive -Client launch switches too.
     $script:Run=$false; $script:Editor=$false; $script:AppBuilder=$false
     $script:Desktop=$false; $script:Dict=$false; $script:Admin=$false
@@ -1801,6 +2238,8 @@ function Invoke-Menu {
             $script:CopyBackup = $true
             $app = & $askApp $true; if ($null -eq $app) { return $false }
             $script:App = $app
+            # Async (pipelined split+copy) is opt-in; prompt for it here.
+            $script:AsyncCopy = Read-YesNo -Prompt "Use async (pipelined split+copy) for large backups?" -Default:$false
         }
 
         "Restore" {
@@ -1881,6 +2320,7 @@ function Invoke-Menu {
     if (-not [string]::IsNullOrWhiteSpace($script:Ini)) { $parts += "-Ini `"$($script:Ini)`"" }
     if (-not [string]::IsNullOrWhiteSpace($script:Pf))  { $parts += "-Pf `"$($script:Pf)`"" }
     if (@($script:AddPfs).Count -gt 0) { $parts += "-AddPfs `"$(@($script:AddPfs) -join ',')`"" }
+    if ($script:AsyncCopy -eq $true)                { $parts += "-AsyncCopy" }
     if ($script:DryRun -eq $true)                   { $parts += "-DryRun" }
     $cmd = $parts -join ' '
 
@@ -2135,19 +2575,25 @@ if ($Backup -eq $true) {
     foreach ($t in $bt) { if (Test-CanAct -Item $t) { Do-Backup -Item $t } }
 }
 
-# COPY BACKUPS - App-driven (dest dev server is fixed per app): -App All copies
-# both apps; -App App1 or -App App2 copies just that one.
+# COPY BACKUPS - runs ON THE PRODUCTION server and PUSHES backups to the dev
+# server's named share (\\<CopyDestServer>\<BackupShareName>\...).  The source is
+# a plain LOCAL path, so this must run where the backups physically live (prod);
+# hence it is PRODUCTION-tier only.  Large .bk files are binary-split, the slices
+# copied with retry, and the dev side reassembles at restore time.  -App scopes
+# which app's backups are copied (All = both).
 if ($CopyBackup -eq $true) {
-    Write-Section "COPY BACKUPS (prod -> dev)"
-    $devInstalls = @($Installs | Where-Object {
-        $_.Tier -eq "Development" -and ($App -eq "All" -or $_.App -eq $App)
-    } | Select-Object Server,App -Unique)
-    if ($devInstalls.Count -eq 0) {
-        Write-Message "  No Development servers match -App $App for CopyBackup." -Fore Yellow
+    Write-Section "COPY BACKUPS (split + push prod -> dev share)"
+    # This machine must host a Production install for the selected app(s).
+    $prodHere = @($Installs | Where-Object {
+        $_.Tier -eq "Production" -and $_.Server -eq $env:COMPUTERNAME -and ($App -eq "All" -or $_.App -eq $App)
+    } | Select-Object -ExpandProperty App -Unique)
+    if ($prodHere.Count -eq 0) {
+        Write-Message ("  CopyBackup must run ON a Production server for -App $App (this host {0} has no matching Production install)." -f $env:COMPUTERNAME) -Fore Red
+        Write-Message "  Refusing to run CopyBackup off the production server (source backups are local, by design)." -Fore Yellow
+        $script:OnError = $true
     }
-    foreach ($d in $devInstalls) {
-        Write-Message ("Copy {0} backups -> {1}" -f $d.App, $d.Server) -Fore Cyan
-        Invoke-CopyBackup -DevServer $d.Server -App $d.App
+    foreach ($a in $prodHere) {
+        Invoke-CopyBackup -App $a
     }
 }
 
@@ -2292,13 +2738,20 @@ exit 0
 ## ============================================================================
 ## CUSTOMIZATION CHECKLIST (search for "CHANGE THIS" to find each spot)
 ## ============================================================================
-##  1. $Installs table .......... your servers, tiers, OpenEdge versions, DLCs, ports
+##  1. $Installs table .......... your servers, tiers, OpenEdge versions, DLCs,
+##                                ports, and each row's SetupDir (the -Client/
+##                                -Batch INI/PF root, per machine + version)
 ##  2. -App ValidateSet ......... your application names (keep in sync with $Installs)
 ##  3. $ValidSites / -Site ...... your site codes (or drop sites if you have none)
 ##  4. Parse-App1Database /
 ##     Parse-App2Database ....... your database NAMING CONVENTION (the regex + maps)
-##  5. Path defaults ............ $DlcBase, $App1BackupDir/$App2BackupBase,
-##                                $App1SetupDir/$App2SetupDir
+##  5. Path defaults ............ $DlcBase, $App1BackupDir/$App2BackupBase
+##                                (setup-tree roots now live in $Installs - item 1)
+##  5b. CopyBackup settings ..... $CopyDestServer, $BackupShareName, $SplitThreshold
+##                                Bytes/$SplitSliceBytes, $CopyMaxRetries/$CopyRetry
+##                                Delay, $AsyncCopy/$AsyncQueueDepth; and the
+##                                $destRoot build in Invoke-CopyBackup (Windows UNC
+##                                vs Linux mount/ssh)
 ##  6. Get-BackupDevice ......... your backup file names/layout
 ##  7. Get-App2EnvStem .......... your single-site app's INI/PF stem per env
 ##  8. Resolve-ClientLaunch ..... client exe per OpenEdge version (GUI vs _progres)
