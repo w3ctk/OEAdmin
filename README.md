@@ -10,6 +10,12 @@ errors, checks broker ports, backs up your `conmgr`/`ubroker` properties before
 state changes, and can email a log/alert. It also has an interactive `-Menu` so
 operators don't have to memorize switches.
 
+`-CopyBackup` runs on the **production** server and **pushes** backups to a named
+share on the dev server; large `.bk` files are binary-**split** into slices
+(copied with retry, optionally pipelined with `-AsyncCopy`), which the dev side
+**reassembles** at restore time — practical for very large backups over a slow
+link.
+
 Nothing about your databases is hardcoded. The managed instances are discovered
 at run time from each OpenEdge install's own property files
 (`conmgr.properties` + `ubroker.properties`). You describe your **servers** once
@@ -62,8 +68,9 @@ Everything below is marked `CHANGE THIS` in the script. In rough priority order:
 
 1. **`$Installs` table** — the heart of the config. One row per OpenEdge install:
    app, tier (Production/Development), server hostname, OpenEdge version, DLC
-   path, and AdminServer port. A single server can have several rows (e.g. two
-   OpenEdge versions side by side).
+   path, AdminServer port, and `SetupDir` (the client INI/PF root for that
+   install — kept per row because it can vary by machine and OE version). A
+   single server can have several rows (e.g. two OpenEdge versions side by side).
 2. **`-App` ValidateSet** — your application names (keep them in sync with
    `$Installs`).
 3. **`$ValidSites` / `-Site`** — your site codes (or drop sites if you have none).
@@ -71,8 +78,13 @@ Everything below is marked `CHANGE THIS` in the script. In rough priority order:
    convention**. This is how the script derives each database's environment and
    site from its name, so you don't list every database by hand. Edit the regex
    and the small maps here.
-5. **Path defaults** — `$DlcBase`, `$App1BackupDir` / `$App2BackupBase`,
-   `$App1SetupDir` / `$App2SetupDir`.
+5. **Path defaults** — `$DlcBase`, `$App1BackupDir` / `$App2BackupBase`. (The
+   client INI/PF setup-tree root is **per install** now — each `$Installs` row's
+   `SetupDir` — not a global, since it can differ by machine and OE version.)
+5b. **CopyBackup settings** — `$CopyDestServer`, `$BackupShareName`,
+   `$SplitThresholdBytes` / `$SplitSliceBytes`, `$CopyMaxRetries` /
+   `$CopyRetryDelay`, `$AsyncCopy` / `$AsyncQueueDepth`; and the destination-root
+   build in `Invoke-CopyBackup` (Windows UNC vs Linux mount/ssh).
 6. **`Get-BackupDevice`** — your backup file names/layout.
 7. **`Get-App2EnvStem`** — the INI/PF filename stem per environment for a
    single-site app.
@@ -128,10 +140,14 @@ switches say what to do. Commands go through the AdminServer via `dbman` /
 # Preview anything without making changes
 ./OEAdmin.ps1 -Backup -DryRun
 
-# Copy production backups onto the dev server (App1)
+# Copy App1 production backups to the dev share (RUN THIS ON THE PROD SERVER)
 ./OEAdmin.ps1 -CopyBackup -App App1
 
-# Restore the site-S2 production backup into the Test databases
+# ...same, but pipeline the split and the copy for a very large backup
+./OEAdmin.ps1 -CopyBackup -App App1 -AsyncCopy
+
+# Restore the site-S2 production backup into the Test databases (reassembles
+# split slices first if the whole .bk isn't staged)
 ./OEAdmin.ps1 -Restore -App App1 -Site S2 -Env Test
 
 # Launch the App1 client for site-S1 Test (and run the startup program)
@@ -149,9 +165,10 @@ switches say what to do. Commands go through the AdminServer via `dbman` /
 ## Safety model
 
 - **Tier guard.** Every install is tagged Production or Development.
-  `-Backup` runs on Production servers only; `-Restore` and `-CopyBackup` run on
-  Development servers only. This structurally prevents an accidental prod restore
-  or dev backup.
+  `-Backup` and `-CopyBackup` run on Production servers only (the backups are
+  local to prod, and `-CopyBackup` splits/pushes them to the dev share);
+  `-Restore` runs on Development servers only. This structurally prevents an
+  accidental prod restore or dev backup.
 - **Required `-Site` for multi-site restores.** When an app has multiple sites
   whose prod backups stage onto one dev server, `-Restore` refuses to run without
   an explicit `-Site`, so a restore can't silently hit both sites.
@@ -173,6 +190,9 @@ switches say what to do. Commands go through the AdminServer via `dbman` /
   cross-server use on Linux, edit `Convert-ToRemotePath` to map a local path to
   however you reach that server (NFS/autofs mount, ssh, etc.). Local operation
   needs no change.
+- **`-CopyBackup`** pushes to a `\\server\share` UNC path by default. On Linux,
+  change the destination-root build in `Invoke-CopyBackup` to your mount/ssh
+  scheme. The split/copy itself uses `Copy-Item`, so it's cross-platform.
 - The **EventLog** integration is Windows-only and is a no-op on Linux.
 
 ---

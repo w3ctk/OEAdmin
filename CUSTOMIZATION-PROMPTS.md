@@ -34,8 +34,9 @@ Every question maps to a `CHANGE THIS` marker in the script.
 >
 > **Topics, in order:** (1) Operating system & where the script will run;
 > (2) Applications; (3) Servers and installs; (4) OpenEdge versions;
-> (5) Database naming convention; (6) Sites/environments; (7) Backup layout;
-> (8) Client (INI/PF) setup layout; (9) Email/SMTP; (10) Remote operation.
+> (5) Database naming convention; (6) Sites/environments; (7) Backup layout &
+> copy-to-dev (split/push settings); (8) Client (INI/PF) setup layout;
+> (9) Email/SMTP; (10) Remote operation.
 >
 > When the interview is complete:
 > - Produce the fully edited `OEAdmin.ps1` with every `CHANGE THIS` spot updated
@@ -111,20 +112,33 @@ For **each OpenEdge install** (a server + a DLC directory + a version):
   `Prod / Dev / Test / SBox`. Add/remove to match yours. *Why:* sets
   `$ValidEnvs` and the env maps in the parsers.
 
-### Topic 7 — Backup layout
+### Topic 7 — Backup layout and copy-to-dev
 - **Q7.1** Where do **backup files** live for each app? (directory + filename
   pattern, e.g. `/opt/erp/backups/erpProdS1.bk`)
   *Why:* sets `$App1BackupDir`/`$App2BackupBase` and the `Get-BackupDevice` map.
-- **Q7.2** Flat directory, or **per-role subdirectories**? *Why:* affects the
-  copy recursion in `Invoke-CopyBackup`.
+  Note: `-CopyBackup` runs **on the production server** and treats this as a
+  **local** path (not a share).
+- **Q7.2** Flat directory, or **per-role subdirectories**? *Why:* the subdir
+  layout is preserved on the destination share by `Invoke-CopyBackup`.
+- **Q7.3** Which **dev server** do backups get pushed to, and what **named share**
+  on it maps to the backup directory? (e.g. server `dbserver1-dev`, share
+  `backups`.) *Why:* sets `$CopyDestServer` and `$BackupShareName`; the copy
+  destination is `\\<CopyDestServer>\<BackupShareName>\...` — deliberately **not**
+  the admin `drive$` share.
+- **Q7.4** Are any backups large enough to want **splitting**? Default splits any
+  `.bk` over 1 GB into 1 GB slices and can pipeline the copy (`-AsyncCopy`).
+  *Why:* sets `$SplitThresholdBytes`, `$SplitSliceBytes`, `$AsyncQueueDepth`, and
+  the retry policy `$CopyMaxRetries`/`$CopyRetryDelay`. On Linux you'll also point
+  the destination-root build in `Invoke-CopyBackup` at your mount/ssh scheme.
 
 ### Topic 8 — Client (INI/PF) setup layout
 *(Skip if you won't use `-Client`/`-Batch`.)*
 - **Q8.1** Where are the **INI and PF files** kept, and how are they named?
   The template expects `<SetupDir>/ini/<server>/<stem>.ini` and
-  `<SetupDir>/userPfs/<server>/<stem>.pf`.
-  *Why:* sets `$App1SetupDir`/`$App2SetupDir`, `Get-ClientIni`/`Get-ClientPf`,
-  and the single-site stem in `Get-App2EnvStem`.
+  `<SetupDir>/userPfs/<server>/<stem>.pf`, where **`SetupDir` is a column on each
+  `$Installs` row** (per machine + OE version), not a global.
+  *Why:* sets each row's `SetupDir`, plus `Get-ClientIni`/`Get-ClientPf` and the
+  single-site stem in `Get-App2EnvStem`.
 - **Q8.2** Do you launch a **startup program** on client launch? What's its path?
   *Why:* sets `$StartupProgram` (used by `-Run`).
 

@@ -55,14 +55,16 @@ is **one OpenEdge install** and carries:
 | Field       | Meaning |
 |-------------|---------|
 | `App`       | Which application this install hosts (matches `-App`). |
-| `Tier`      | `Production` or `Development` — gates backup vs restore. |
+| `Tier`      | `Production` or `Development` — gates backup/copy vs restore. |
 | `Server`    | Hostname (matches `-Server`; compared to the local machine name). |
 | `OEVersion` | OpenEdge version string (matches `-OEVersion`). |
 | `DLC`       | The OpenEdge install directory for this install. |
 | `Port`      | The AdminServer management port for this install. |
+| `SetupDir`  | Root of this install's `-Client`/`-Batch` INI/PF tree (INI under `<SetupDir>/ini/<server>/`, PF under `<SetupDir>/userPfs/<server>/`). Per install, not global, because the root can differ by machine **and** OE version. |
 
 A single server can appear in several rows (for example, two OpenEdge versions
-installed side by side on different DLC paths and ports).
+installed side by side on different DLC paths and ports, each with its own
+`SetupDir`).
 
 ### 2.2 Inventory (discovered, not listed)
 
@@ -89,8 +91,10 @@ NameServer, or an MSSQLBroker.
 
 The Production/Development tier on each install drives a safety model:
 
-- `-Backup` runs on **Production** installs only.
-- `-Restore` and `-CopyBackup` run on **Development** installs only.
+- `-Backup` and `-CopyBackup` run on **Production** installs only (the backups
+  are local to the production server; `-CopyBackup` splits and pushes them to the
+  dev server's share).
+- `-Restore` runs on **Development** installs only.
 
 This makes the unusual/dangerous cases (restoring over production, backing up a
 dev copy) structurally impossible through this tool.
@@ -132,11 +136,11 @@ List your real servers. Example:
 
 ```powershell
 $Installs=@(
-    [PSCustomObject]@{ App="App1"; Tier="Production";  Server="dbserver1";     OEVersion="12.8";  DLC="/usr/dlc";     Port=20931 }
-    [PSCustomObject]@{ App="App1"; Tier="Development"; Server="dbserver1-dev"; OEVersion="12.8";  DLC="/usr/dlc";     Port=20931 }
-    [PSCustomObject]@{ App="App1"; Tier="Development"; Server="dbserver1-dev"; OEVersion="10.2B"; DLC="/usr/dlc102b"; Port=20941 }
-    [PSCustomObject]@{ App="App2"; Tier="Production";  Server="dbserver2";     OEVersion="12.8";  DLC="/usr/dlc";     Port=20931 }
-    [PSCustomObject]@{ App="App2"; Tier="Development"; Server="dbserver2-dev"; OEVersion="12.8";  DLC="/usr/dlc";     Port=20931 }
+    [PSCustomObject]@{ App="App1"; Tier="Production";  Server="dbserver1";     OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; SetupDir="/opt/app1/setup" }
+    [PSCustomObject]@{ App="App1"; Tier="Development"; Server="dbserver1-dev"; OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; SetupDir="/opt/app1/setup" }
+    [PSCustomObject]@{ App="App1"; Tier="Development"; Server="dbserver1-dev"; OEVersion="10.2B"; DLC="/usr/dlc102b"; Port=20941; SetupDir="/opt/app1/setup-102b" }
+    [PSCustomObject]@{ App="App2"; Tier="Production";  Server="dbserver2";     OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; SetupDir="/opt/app2/setup" }
+    [PSCustomObject]@{ App="App2"; Tier="Development"; Server="dbserver2-dev"; OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; SetupDir="/opt/app2/setup" }
 )
 ```
 
@@ -180,8 +184,26 @@ QA/scratch/template databases get skipped automatically. Add a case in
 
 - `$DlcBase` — default OpenEdge home (`/usr/dlc` on Linux, e.g.
   `C:/Progress/OpenEdge` on Windows).
-- `$App1BackupDir` / `$App2BackupBase` — where backups live.
-- `$App1SetupDir` / `$App2SetupDir` — the INI/PF setup trees for the client.
+- `$App1BackupDir` / `$App2BackupBase` — where backups live (the `-CopyBackup`
+  source, local to the production server).
+- **Client INI/PF setup tree** — this is now the per-install `SetupDir` column in
+  `$Installs` (section 2.1), not a global. Set each row's `SetupDir` to its
+  machine + version's setup root.
+
+### 4.5b CopyBackup settings (as needed)
+
+- `$CopyDestServer` — the dev server `-CopyBackup` pushes to.
+- `$BackupShareName` — the **named share** on that dev server (destination is
+  `\\<CopyDestServer>\<BackupShareName>\...`, deliberately **not** the admin
+  `drive$` share).
+- `$SplitThresholdBytes` (default `1GB`) — a `.bk` larger than this is split.
+- `$SplitSliceBytes` (default `1GB`) — slice size.
+- `$CopyMaxRetries` / `$CopyRetryDelay` (defaults `5` / `15s`) — per-file copy
+  retry/backoff.
+- `$AsyncCopy` / `$AsyncQueueDepth` (default depth `3`) — pipeline split+copy and
+  cap how many slices sit on local disk at once.
+- The destination-root build in `Invoke-CopyBackup` uses the Windows
+  `\\server\share` UNC form; on Linux change it to your mount/ssh scheme.
 
 ### 4.6 Backup file layout (`Get-BackupDevice`) (as needed)
 
@@ -284,11 +306,36 @@ database, as stop → prorest → start. **`-Site` is required for a multi-site 
 (e.g. App1) so a restore can't silently fan out across sites. Single-source apps
 (App2) don't need `-Site`.
 
-### 7.7 `-CopyBackup` (Development servers only)
+If the whole `.bk` isn't staged but a `split/<basename>/` folder of slices is
+(left by `-CopyBackup` for a large backup), `-Restore` **reassembles** the `.bk`
+first (progress meter, manifest-checked), then deletes the slices and proceeds.
 
-Copies production backup files onto the development server, scoped by `-App`. On
-Windows it uses `robocopy`; on Linux it uses `rsync` (adjust in
-`Invoke-CopyBackup` if you prefer another method).
+A short **settle delay** (`$SettleDelay`, default 5 s) is inserted after `prodel`
+and after `prorest` so back-to-back operations on the same database don't race
+the OS releasing file handles ("database in use").
+
+### 7.7 `-CopyBackup` (Production servers only)
+
+**Runs on the production server** and **pushes** production backups to the dev
+server's **named share** (`\\<CopyDestServer>\<BackupShareName>\...`, not the
+admin `drive$` share), scoped by `-App`. The source is a plain **local** path.
+
+- A `.bk` larger than `$SplitThresholdBytes` (default 1 GB) is binary-**split**
+  into `$SplitSliceBytes` slices (progress meter) under a local
+  `split/<basename>/` folder, with a small `.split.manifest` (original name,
+  size, slice size, part count).
+- Each slice is copied to the dev share with **retry/backoff**
+  (`$CopyMaxRetries` / `$CopyRetryDelay`), and the **local slice is deleted as
+  soon as it lands**, so production scratch stays small.
+- Files at/under the threshold copy whole (same retry logic).
+- The dev side reassembles the slices at restore time (see 7.6).
+
+**`-AsyncCopy`** pipelines the split and the copy: a background runspace copies
+slice *N* over the network while the main thread carves slice *N+1* from disk.
+A bounded queue (`$AsyncQueueDepth`, default 3) caps how many finished slices sit
+on local disk at once (~depth × slice size). Opt-in; the synchronous
+split-then-copy path runs when it's off. (Uses a runspace + `BlockingCollection`,
+so it works on both Windows PowerShell 5.1 and 7.)
 
 ### 7.8 `-Client`
 
@@ -403,7 +450,9 @@ With `-Remote` and no `-Server`, the script targets **all** servers.
   Linux, so `dbman` vs `dbman.bat` is automatic.
 - **Client exe.** `Resolve-ClientLaunch` picks `prowin`/`prowin32` on Windows and
   `_progres` on Linux (adjust as needed).
-- **Copy tool.** `robocopy` on Windows, `rsync` on Linux.
+- **Copy tool.** `-CopyBackup` uses `Copy-Item` (with split/retry), pushing to a
+  `\\server\share` UNC path by default; change the destination-root build in
+  `Invoke-CopyBackup` for a Linux mount/ssh scheme.
 - **Services file.** `/etc/services` on Linux, `%windir%\System32\drivers\etc\services`
   on Windows.
 - **EventLog.** Windows only; silently skipped elsewhere.
@@ -426,8 +475,13 @@ Actions: `-Menu`, `-Status`, `-Start`, `-Stop`, `-Restart`, `-Backup`,
 `-Restore`, `-CopyBackup`, `-Client`, `-Run`, `-Batch`, `-Pgm`,
 `-StartupProgram`.
 
-Paths: `-DlcBase`, `-App1BackupDir`, `-App2BackupBase`, `-App1SetupDir`,
-`-App2SetupDir`, `-Ini`, `-Pf`, `-AddPfs`.
+CopyBackup: `-CopyDestServer`, `-BackupShareName`, `-SplitThresholdBytes`,
+`-SplitSliceBytes`, `-CopyMaxRetries`, `-CopyRetryDelay`, `-AsyncCopy`,
+`-AsyncQueueDepth`.
+
+Paths: `-DlcBase`, `-App1BackupDir`, `-App2BackupBase`, `-Ini`, `-Pf`, `-AddPfs`.
+(The client setup-tree root is the per-install `SetupDir` in `$Installs`, not a
+global parameter.)
 
 Email: `-EmailOnError`, `-SmtpServer`, `-SmtpPort`, `-SmtpUseSsl`, `-EmailFrom`,
 `-EmailTo`.
@@ -495,6 +549,16 @@ or fix the `Port` in `$Installs`.
 
 **`-Restore` for App1 refuses to run.**
 `-Site` is required for multi-site restores. Add `-Site S1` or `-Site S2`.
+
+**`-CopyBackup` refuses to run.**
+It must run **on a Production server** for the selected `-App` (the source
+backups are a local path there). Run it on the production box, not dev or a
+management station.
+
+**`-CopyBackup` can't write to the dev share.**
+The destination is `\\<CopyDestServer>\<BackupShareName>\...` — confirm that
+named share exists on the dev server and points at its backup directory, and that
+you have write access. It is deliberately not the admin `drive$` share.
 
 **Client won't launch / INI or PF not found.**
 Check the setup-tree layout (`ini/<server>/`, `userPfs/<server>/`) and the stem
