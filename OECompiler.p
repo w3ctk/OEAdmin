@@ -150,7 +150,12 @@ DO ON ERROR UNDO, LEAVE ON STOP UNDO, LEAVE:
         RUN WriteStatus (INPUT -1).
         QUIT.
     END.
-    cSourceRoot = FILE-INFO:FULL-PATHNAME.
+    /* Standardize the source root to forward slashes.  FULL-PATHNAME returns
+       backslashes on Windows, but BuildOutPath standardizes each file's path to
+       '/' before testing "cFull BEGINS cSourceRoot" - so the root MUST also be
+       '/'-form or that test fails and the mirrored output path is built wrong
+       (which left listing/xref dirs uncreated and the compile erroring on write). */
+    cSourceRoot = REPLACE(FILE-INFO:FULL-PATHNAME, "~\", "/").
 
     IF cFileSpecs = "" OR cFileSpecs = ? THEN cFileSpecs = "*.p *.w *.cls *.t".
     IF cMode = ? OR (cMode <> "full" AND cMode <> "incremental") THEN cMode = "full".
@@ -275,7 +280,10 @@ PROCEDURE CompileFile:
     DEFINE VARIABLE cSrcDir   AS CHARACTER NO-UNDO.
     DEFINE VARIABLE iPos      AS INTEGER   NO-UNDO.
     DEFINE VARIABLE iMsg      AS INTEGER   NO-UNDO.
+    DEFINE VARIABLE iNumMsg   AS INTEGER   NO-UNDO.
+    DEFINE VARIABLE cMsgs     AS CHARACTER NO-UNDO.
     DEFINE VARIABLE lHadError AS LOGICAL   NO-UNDO.
+    DEFINE VARIABLE lHadWarn  AS LOGICAL   NO-UNDO.
 
     /* The .r goes BESIDE the source.  We give COMPILE an explicit SAVE INTO the
        source file's own directory rather than a bare SAVE: in a batch session a
@@ -329,29 +337,50 @@ PROCEDURE CompileFile:
     ELSE
         COMPILE VALUE(p_File) SAVE INTO VALUE(cSrcDir) NO-ERROR.
 
+    /* CAPTURE the compiler result IMMEDIATELY after COMPILE, into plain locals,
+       before any RUN or stream I/O.  Reading COMPILER:NUM-MESSAGES only AFTER the
+       "ERROR/OK" log line proved unreliable (it came back 0, so no messages were
+       ever printed); snapshotting here - in one tight loop right after COMPILE -
+       and logging from the snapshot fixes that.  Messages accumulate into a single
+       CHR(10)-delimited string (no temp-table, to stay simple in a -p startup). */
+    ASSIGN lHadError = COMPILER:ERROR
+           lHadWarn  = COMPILER:WARNING
+           iNumMsg   = COMPILER:NUM-MESSAGES
+           cMsgs     = "".
+    IF iNumMsg > 0 THEN
+    DO iMsg = 1 TO iNumMsg:
+        cMsgs = cMsgs
+              + (IF cMsgs = "" THEN "" ELSE CHR(10))
+              + "         [" + STRING(COMPILER:GET-ERROR-ROW(iMsg)) + ","
+              + STRING(COMPILER:GET-ERROR-COLUMN(iMsg)) + "] "
+              + COMPILER:GET-MESSAGE(iMsg).
+    END.
+
     iCompiled = iCompiled + 1.
 
-    /* Report per the COMPILER handle (same mechanism as adecomp). */
-    IF COMPILER:ERROR THEN DO:
-        lHadError = YES.
+    /* Report from the SNAPSHOT (not the live handle). */
+    IF lHadError THEN DO:
         iErrors = iErrors + 1.
         RUN Log ("ERROR  : " + p_File).
     END.
-    ELSE IF COMPILER:WARNING THEN DO:
+    ELSE IF lHadWarn THEN DO:
         iWarnings = iWarnings + 1.
         RUN Log ("WARNING: " + p_File).
     END.
     ELSE
         RUN Log ("OK     : " + p_File).
 
-    /* Dump compiler messages (errors AND warnings) to the log, with row/col from
-       the COMPILER handle (same API adecomp and the headless harness use). */
-    IF (COMPILER:ERROR OR COMPILER:WARNING) AND COMPILER:NUM-MESSAGES > 0 THEN
-    DO iMsg = 1 TO COMPILER:NUM-MESSAGES:
-        RUN Log ("         [" + STRING(COMPILER:GET-ERROR-ROW(iMsg)) + ","
-                 + STRING(COMPILER:GET-ERROR-COLUMN(iMsg)) + "] "
-                 + COMPILER:GET-MESSAGE(iMsg)).
+    /* Dump the captured messages (errors AND warnings), one per line. */
+    IF cMsgs <> "" THEN
+    DO iMsg = 1 TO NUM-ENTRIES(cMsgs, CHR(10)):
+        RUN Log (ENTRY(iMsg, cMsgs, CHR(10))).
     END.
+    /* ERROR with ZERO messages means the compile could not WRITE an output file
+       (r-code / listing / xref) - a missing/unwritable target directory - not a
+       source problem.  Say so explicitly instead of a bare, mysterious ERROR. */
+    ELSE IF lHadError THEN
+        RUN Log ("         (no compiler messages - output write failed; check that"
+                 + " the r-code/listing/xref target dirs exist and are writable)").
 END PROCEDURE.
 
 
@@ -446,7 +475,11 @@ PROCEDURE BuildOutPath:
 END PROCEDURE.
 
 
-/* Create a directory path if it does not exist (OS-independent, step by step). */
+/* Create a directory path (and any missing parents) if it does not exist.
+   Builds up the path segment by segment and OS-CREATE-DIRs each missing level,
+   using the OS-NATIVE separator (backslash on Windows) because OS-CREATE-DIR with
+   forward slashes silently fails on Windows - which was leaving listing/xref/
+   r-code target dirs absent, so COMPILE then errored with NO messages. */
 PROCEDURE EnsureDir:
     DEFINE INPUT PARAMETER p_Dir AS CHARACTER NO-UNDO.
 
@@ -454,7 +487,14 @@ PROCEDURE EnsureDir:
     DEFINE VARIABLE cSoFar AS CHARACTER NO-UNDO.
     DEFINE VARIABLE iSeg  AS INTEGER   NO-UNDO.
     DEFINE VARIABLE cSeg  AS CHARACTER NO-UNDO.
+    DEFINE VARIABLE cSep  AS CHARACTER NO-UNDO.
 
+    IF p_Dir = "" OR p_Dir = ? THEN RETURN.
+
+    /* OS-native separator: backslash on Windows, forward slash elsewhere. */
+    cSep = IF OPSYS = "WIN32":U THEN "~\" ELSE "/".
+
+    /* Normalize to '/' for splitting, test existence first. */
     cNorm = REPLACE(p_Dir, "~\", "/").
     FILE-INFO:FILE-NAME = cNorm.
     IF FILE-INFO:FULL-PATHNAME <> ? THEN RETURN.   /* already exists */
@@ -462,10 +502,11 @@ PROCEDURE EnsureDir:
     DO iSeg = 1 TO NUM-ENTRIES(cNorm, "/"):
         cSeg = ENTRY(iSeg, cNorm, "/").
         IF iSeg = 1 THEN
-            cSoFar = cSeg.          /* drive (C:) or empty for leading / */
+            cSoFar = cSeg.          /* drive (C:) on Windows, or "" for leading / */
         ELSE
-            cSoFar = cSoFar + "/" + cSeg.
-        IF cSoFar = "" THEN NEXT.   /* leading / on unix */
+            cSoFar = cSoFar + cSep + cSeg.
+        IF cSoFar = "" THEN NEXT.   /* leading / on unix: skip the empty root seg */
+        IF iSeg = 1 AND OPSYS = "WIN32":U THEN NEXT.  /* don't mkdir a bare drive "C:" */
         FILE-INFO:FILE-NAME = cSoFar.
         IF FILE-INFO:FULL-PATHNAME = ? THEN
             OS-CREATE-DIR VALUE(cSoFar).
