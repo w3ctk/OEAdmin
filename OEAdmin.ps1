@@ -2751,13 +2751,29 @@ function Do-Compile {
     if (-not [string]::IsNullOrWhiteSpace($effExcludeFile)) {
         $exPath = if ($effExcludeFile -match '[\\/]') { $effExcludeFile } else { Join-PathX $PSScriptRoot $effExcludeFile }
         if (Test-Path -Path $exPath -PathType Leaf) {
+            $exFileCount = 0
             foreach ($ln in (Get-Content -Path $exPath)) {
                 $ln = $ln.Trim()
                 if ([string]::IsNullOrWhiteSpace($ln) -or $ln.StartsWith('#')) { continue }
-                $exPatterns.Add($ln)
+                $exPatterns.Add($ln); $exFileCount++
             }
+            Write-Message ("  Excludes: loaded {0} pattern(s) from {1}" -f $exFileCount, $exPath) -Fore DarkGray
         } else {
-            Write-Message ("  Compile: -ExcludeFile not found: {0}" -f $exPath) -Fore Yellow
+            # The exclude FILE was named (explicitly via -ExcludeFile, or auto-
+            # defaulted by -Package to the standing compile-excludes.txt) but is
+            # not on disk.  Warn LOUDLY: with no excludes, vendor/sample code that
+            # never compiles standalone will error and (for -Package) fail-close
+            # the whole bundle - which looks like "everything is broken".
+            $exWhy = if ($null -ne $OverrideExcludeFile) {
+                         "the standing exclude file was not found (so NOTHING will be excluded)"
+                     } else {
+                         "-ExcludeFile not found (so NOTHING will be excluded)"
+                     }
+            Write-Message ("  WARNING: {0}: {1}" -f $exWhy, $exPath) -Fore Red
+            Write-Message  "           Expected-error files (vendor/sample code) will COMPILE and ERROR." -Fore Red
+            if ($null -ne $OverrideExcludeFile) {
+                Write-Message ("           Put compile-excludes.txt in the OEAdmin folder ({0}), or pass -ExcludeFile <path>." -f $PSScriptRoot) -Fore Red
+            }
         }
     }
     $excludesValue = ($exPatterns -join ([char]1))
@@ -3383,7 +3399,10 @@ function Do-Package {
             $ec = if ($null -eq $ci) { "(compile did not run)" } else { $ci.Errors }
             Write-Message ("  Package: fresh compile did not complete clean (errors={0}). Bundle aborted." -f $ec) -Fore Red
             if ($ci -and $ci.LogFile) { Write-Message ("    log: {0}" -f $ci.LogFile) -Fore Red }
-            Remove-Item -Path $staging -Recurse -Force -ErrorAction SilentlyContinue
+            # Keep the staging tree (it holds compile/compile.log with the per-file
+            # ERROR/SKIP lines) so the failure can be diagnosed; it is small without
+            # the source/rcode/zip, and a later clean run writes a fresh stamped dir.
+            Write-Message ("    (staging kept for review: {0})" -f $staging) -Fore DarkGray
             $script:OnError = $true; return
         }
     }
