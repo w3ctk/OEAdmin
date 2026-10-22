@@ -92,7 +92,7 @@ as a Database with `Role="Extra"` and `Site`/`Env="All"`.
   `-OEVersion`, `-Component`.
 - **Actions** say what to do to the selection: `-Status` (default), `-Start`,
   `-Stop`, `-Restart`, `-Backup`, `-Restore`, `-CopyBackup`, `-Client`,
-  `-Batch`, and the interactive `-Menu`.
+  `-Batch`, `-Compile`, and the interactive `-Menu`.
 
 ### 2.4 Tiers and the safety guard
 
@@ -452,6 +452,52 @@ Same resolution as `-Client` but runs a program non-interactively:
 `<script dir>/<program>.out` and stderr to `<program>.err`. A non-zero exit sets
 the error flag.
 
+### 7.9a `-Compile` (headless Application Compiler)
+
+`-Compile` compiles your application source without a UI. It uses the **same**
+launch machinery as `-Batch` — same client exe (by OE version), the same INI and
+PF (so the same PROPATH and database connections), the same `-Ini`/`-Pf`/`-AddPfs`
+overrides and `App`/`Site`/`Env`/`Server` selectors — but the `-p` program is the
+bundled driver **`OECompiler.p`** (shipped beside the script and passed by full
+path, so it needs no PROPATH entry), and the compile options travel in a generated
+**parameter file** (`-param`), not through any dialog:
+
+```
+<exe> -ininame <ini> -pf <pf> -p <script dir>/OECompiler.p -param <paramfile> -b
+```
+
+`OECompiler.p` is a stripped-down, broadly-compatible port of the OpenEdge
+Application Compiler: it walks the source tree, compiles every file matching
+`-FileSpec` (default `*.p *.w *.cls *.t`), and `SAVE`s the `.r` **beside the
+source**.
+
+What you control:
+
+| Switch | Effect |
+|---|---|
+| `-FileSpec "<specs>"` | Space-separated `MATCHES` patterns. Default `*.p *.w *.cls *.t`. |
+| `-Dir <relpath>` | Restrict to one sub-directory of the source root (recursive within it). |
+| `-Incremental` | Compile only files whose `.r` is **missing** or whose source is **newer** than its `.r`. Absent = full rebuild. |
+| `-Listing` | Also write a per-file **LISTING** (off by default). |
+| `-Xref` / `-XrefXml` | Also write a per-file **XREF** (plain, or XML with `-XrefXml`); off by default. |
+| `-Installed` | Compile the installed tree (`InstallDir`). Absent = the `-Workspace` worktree (default; falls back to installed if no `-Workspace`). |
+
+**Source** is the `-Workspace` worktree by default (same resolution as a
+`-Workspace` client launch, so references resolve against the working copy), or
+the installed code with `-Installed`.
+
+**Output** goes under `<sourceroot>/x/<yyyy-MM-dd_HHmmss>/`:
+
+- `compile.log` — **always** written; one consolidated log of every file's result
+  plus a `compiled / errors / warnings` summary.
+- `listing/` — per-file `.listing` files (only with `-Listing`), mirroring each
+  source file's relative path.
+- `xref/` — per-file `.xref` files (only with `-Xref`/`-XrefXml`), same mirroring.
+
+If any file has a compiler **error**, `OECompiler.p` exits non-zero and OEAdmin
+flags it loudly (red, with the error count and the path to `compile.log`) and sets
+the error flag — so a broken compile is impossible to miss.
+
 ### 7.10 `-Git` (local repo/worktree maintenance)
 
 `-Git` is an extensible action group for git work. It has two **maintenance**
@@ -691,6 +737,10 @@ Settings backup: `-SettingsBackup`, `-ForceBackup`.
 Actions: `-Menu`, `-Status`, `-Start`, `-Stop`, `-Restart`, `-Backup`,
 `-Restore`, `-CopyBackup`, `-Client`, `-Run`, `-Batch`, `-Pgm`,
 `-StartupProgram`, `-Git`.
+
+Compile: `-Compile` (headless Application Compiler via `OECompiler.p`),
+`-FileSpec` (default `*.p *.w *.cls *.t`), `-Dir`, `-Incremental`, `-Listing`,
+`-Xref`, `-XrefXml`, `-Installed`.
 
 Client tools & workspaces: `-Tool` (named entry from the `$Tools` map),
 `-Workspace` (launch from a git working copy), `-Run`/`-Editor`/`-AppBuilder`/

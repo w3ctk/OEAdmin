@@ -231,6 +231,21 @@ worktree maintenance, from this tool.)*
   only shown by `-GitHelp`. Nothing to answer here — just decide whether to tell
   your team about them.
 
+### Topic 13 — Compile (`-Compile`) — nothing to configure
+
+*(Informational — no interview questions.)* `-Compile` runs the OpenEdge
+Application Compiler headlessly. It needs **no** customization: it reuses the same
+client exe / INI / PF resolution you already set up for `-Client`/`-Batch`, so it
+inherits your PROPATH and database connections automatically. The one requirement
+is that the bundled driver **`OECompiler.p`** stays **beside `OEAdmin.ps1`** (the
+script passes it to `-p` by full path, so it does not need to be on PROPATH). The
+compiler saves `.r` beside the source and writes its log/listing/xref under
+`<sourceroot>/x/<timestamp>/`. Defaults (file spec `*.p *.w *.cls *.t`, full
+rebuild, log-only) work out of the box; `-Incremental`, `-FileSpec`, `-Dir`,
+`-Listing`, `-Xref`/`-XrefXml`, and `-Installed` tune a run. If you support a very
+old OpenEdge (9.x), note `OECompiler.p` is written in pre-11 ABL on purpose so it
+compiles there too.
+
 ---
 
 ## Part 3 — After customizing

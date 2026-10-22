@@ -192,6 +192,12 @@ shared components (NameServer / MSSQLBroker / OracleBroker) it actually runs.
 # Run a program in batch
 ./OEAdmin.ps1 -Batch -App App1 -Site S1 -Env Test -Pgm sh/startup.p
 
+# Compile the app source (headless Application Compiler); full compile of a worktree
+./OEAdmin.ps1 -Compile -App App1 -Site S1 -Env Test -Workspace my-feature-branch
+
+# ...incremental (missing/newer-than-.r only), with per-file listing + xref output
+./OEAdmin.ps1 -Compile -App App1 -Site S1 -Env Test -Workspace my-feature-branch -Incremental -Listing -Xref
+
 # Fast-forward every mapped repo's worktrees (fetch + merge --ff-only), standalone
 ./OEAdmin.ps1 -Git -UpdateRepos
 ./OEAdmin.ps1 -Git -UpdateRepos -App App1   # scope to one app's repos

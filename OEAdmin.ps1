@@ -43,6 +43,25 @@ You may obtain a copy of the License at
         (a single "Launch into which program?" picker replaces the old startup
         yes/no prompt).
 
+1.2.0 - Added -Compile: a headless Application Compiler.  Launches the SAME batch
+        client session as -Batch (same exe by OE version, same INI/PF, same
+        -Ini/-Pf/-AddPfs overrides, same App/Site/Env/Server selectors) but the
+        "-p" program is the bundled driver OECompiler.p (passed by FULL PATH, so
+        no PROPATH entry is needed) and all compile options travel in a generated
+        PARAMETER FILE (-param), not via UI.  OECompiler.p is a stripped-down,
+        9.1E-safe port of the OpenEdge Application Compiler (adecomp) - no UI, no
+        VMS/license/XCODE, no MIN-SIZE/STREAM-IO/MD5/LANGUAGES/V6FRAME.  It walks
+        the source recursively, compiles files matching -FileSpec (default
+        "*.p *.w *.cls *.t", incl. *.t DB triggers), and SAVEs the .r beside the
+        source.  -Incremental compiles only files whose .r is MISSING or whose
+        source is NEWER than the .r; absent = full rebuild.  Source is the
+        -Workspace worktree by default, or the installed tree with -Installed.
+        Output under <sourceroot>/x/<yyyy-MM-dd_HHmmss>/: compile.log ALWAYS,
+        plus per-file LISTING (-Listing) and XREF (-Xref / -XrefXml) when
+        requested (OFF by default).  A file with COMPILER errors makes the driver
+        QUIT 1; OEAdmin flags it (red, error count + log path) and sets OnError.
+        Wired into -Menu (source/filespec/dir/mode/outputs flow).
+
 #>
 
 <#
@@ -137,6 +156,17 @@ ACTIONS:
                  environment.  See per-app rules under the -Client parameter.
     -Batch       Same as -Client but runs a program in batch: the command line
                  ends with "-p <program> -b".  -Pgm <program>.p is REQUIRED.
+    -Compile     Headless Application Compiler.  Same launch/selectors/overrides as
+                 -Batch, but the "-p" program is the bundled OECompiler.p (full
+                 path, no PROPATH needed) and compile options pass in a generated
+                 parameter file.  Compiles -FileSpec (default "*.p *.w *.cls *.t")
+                 under the source root (recursive), SAVEing .r beside the source.
+                 -Dir restricts to a sub-directory; -Incremental compiles only
+                 missing/newer-than-.r files (absent = full rebuild).  Source is the
+                 -Workspace worktree by default, or -Installed for the install tree.
+                 Output under <sourceroot>/x/<stamp>/: compile.log always, plus
+                 -Listing (listing/) and -Xref/-XrefXml (xref/) per-file when set.
+                 Any COMPILER error is flagged loudly and sets the error exit.
 
 Backup / restore safety model:
     A server Tier (Production vs Development) is attached to every install.
@@ -195,6 +225,15 @@ Usage examples (all switches shown; App/Site/Env names are placeholders):
 
     # Run a program in batch (out/err -> <script dir>/startup.out/.err)
     ./OEAdmin.ps1 -Batch -App App1 -Site S1 -Env Test -Pgm sh/startup.p
+
+    # Compile (headless Application Compiler) - full compile of a worktree
+    ./OEAdmin.ps1 -Compile -App App1 -Site S1 -Env Test -Workspace feature-x
+
+    # ...incremental (missing/newer-than-.r only), with per-file listing + xref
+    ./OEAdmin.ps1 -Compile -App App1 -Site S1 -Env Test -Workspace feature-x -Incremental -Listing -Xref
+
+    # ...one sub-directory of the INSTALLED code, specific file spec
+    ./OEAdmin.ps1 -Compile -App App1 -Site S1 -Env Test -Installed -Dir src -FileSpec "*.p *.t"
 
     # Status of ALL servers from one box, over the network (files + -host <server>)
     ./OEAdmin.ps1 -Remote
@@ -498,6 +537,42 @@ param (
     # for -Batch.  Standard output goes to <script dir>/<program>.out and standard
     # error to <program>.err (program base name, path/extension stripped).
     $Pgm="",
+
+    ##### ---- COMPILE (-Compile) ----------------------------------------------
+    # -Compile: compile the application source with the OpenEdge Application
+    # Compiler, headless.  It launches EXACTLY the same batch client session as
+    # -Batch (same exe by OE version, same INI and PF, same -Ini/-Pf/-AddPfs
+    # overrides, same App/Site/Env/Server selectors), but the "-p" program is the
+    # bundled headless driver OECompiler.p (passed by FULL PATH, so it needs no
+    # PROPATH entry) and the compile options travel in a generated PARAMETER FILE
+    # (-param), not via UI.  Source is the -Workspace worktree by default, or the
+    # installed tree with -Installed.  r-code is saved beside the source.  Output:
+    # always a consolidated log, plus optional per-file LISTING / XREF, under
+    #   <sourceroot>/x/<yyyy-MM-dd_HHmmss>/{compile.log, listing/, xref/}
+    [switch]$Compile,
+
+    # Space-separated MATCHES file spec(s) to compile.  Default compiles ABL
+    # procedures, windows, classes, and database-trigger code.
+    $FileSpec="*.p *.w *.cls *.t",
+
+    # Optional sub-directory (relative to the source root) to restrict the compile
+    # to one branch of the tree.  Blank = whole source root.
+    $Dir="",
+
+    # -Incremental: compile only what NEEDS it - a source whose .r is MISSING or
+    # whose source file is NEWER than its .r.  Absent = full rebuild.
+    [switch]$Incremental,
+
+    # -Listing / -Xref: also generate per-file LISTING / XREF output (OFF by
+    # default; the log is always written).  -XrefXml makes XREF output XML format.
+    [switch]$Listing,
+    [switch]$Xref,
+    [switch]$XrefXml,
+
+    # -Installed: compile the INSTALLED code (the install's InstallDir) instead of
+    # a git working copy.  Absent = the -Workspace worktree (default); with no
+    # -Workspace either, it falls back to the installed tree.
+    [switch]$Installed,
 
     # The startup program appended by -Run (and the menu's "run startup?" prompt).
     # CHANGE THIS to your own startup .p if you use one.
@@ -2397,6 +2472,160 @@ function Do-Batch {
     }
 }
 
+# Resolve the SOURCE ROOT a -Compile run compiles under for one target.  Default
+# is the -Workspace worktree app folder (same resolution -Client/-Batch use); with
+# -Installed (or when no -Workspace is given) it is the install's InstallDir.  The
+# session's PROPATH/INI still comes from the same -Client/-Batch machinery, so a
+# -Workspace compile resolves references against the worktree exactly like a
+# -Workspace client launch.  Returns $null if it can't be resolved.
+function Get-CompileSourceRoot {
+    param($Item)
+    if ($Installed -ne $true -and -not [string]::IsNullOrWhiteSpace($Workspace)) {
+        $wd = Get-WorkspaceWorkDir -App $Item.App
+        if ($wd) { return $wd }
+        Write-Message ("  Compile: workspace '{0}' not resolved for {1}; falling back to installed tree." -f $Workspace, $Item.App) -Fore Yellow
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Item.InstallDir)) {
+        if ($Remote -eq $true) { return (Convert-ToRemotePath -Server $Item.Server -LocalPath $Item.InstallDir) }
+        return $Item.InstallDir
+    }
+    return $null
+}
+
+# Run the headless Application Compiler (OECompiler.p) for one environment.  This
+# is a -Batch launch with a fixed "-p <full path>/OECompiler.p -param <paramfile>":
+#   <exe> -ininame <ini> -pf <pf> -p <...>/OECompiler.p -param <paramfile> -b
+# OEAdmin writes the per-run output tree <sourceroot>/x/<stamp>/ (compile.log,
+# and listing/ / xref/ when enabled) and a temp parameter file carrying the
+# compile options, then launches blocking and captures stdout/stderr.  A non-zero
+# program exit (OECompiler QUITs 1 when any file had COMPILER errors) is surfaced
+# loudly and sets $script:OnError.
+function Do-Compile {
+    param($Item)
+    $L = Resolve-ClientLaunch -Item $Item -Tag "Compile"
+    if (-not $L) { return }
+
+    # The driver ships beside this script; pass it to -p by FULL PATH (no PROPATH).
+    $driver = Join-PathX $PSScriptRoot "OECompiler.p"
+    if ($DryRun -ne $true -and -not (Test-Path -Path $driver -PathType Leaf)) {
+        Write-Message ("  Compile: driver not found: {0}" -f $driver) -Fore Red
+        $script:OnError = $true; return
+    }
+
+    # Source root (worktree or installed tree).
+    $srcRoot = Get-CompileSourceRoot -Item $Item
+    if (-not $srcRoot) {
+        Write-Message ("  Compile: could not resolve a source root for {0}" -f $Item.Name) -Fore Red
+        $script:OnError = $true; return
+    }
+
+    # Per-run output tree under <sourceroot>/x/<stamp>/.
+    $stamp   = [DateTime]::Now.ToString("yyyy-MM-dd_HHmmss")
+    $runDir  = Join-PathX (Join-PathX $srcRoot "x") $stamp
+    $logFile = Join-PathX $runDir "compile.log"
+    $listDir = Join-PathX $runDir "listing"
+    $xrefDir = Join-PathX $runDir "xref"
+    $mode    = if ($Incremental -eq $true) { "incremental" } else { "full" }
+
+    # The parameter file the driver reads (SESSION:PARAMETER).
+    $paramFile = Join-PathX $PSScriptRoot ("oecompile_{0}.param" -f $stamp)
+    # ABL QUIT carries no OS exit code, so the driver reports pass/fail by writing
+    # a status file ("ERRORS=<n>", or -1 on a setup abort) that we read afterward.
+    $statusFile = Join-PathX $runDir "compile.status"
+
+    Write-Message ("Compile: {0,-40} {1}  [{2}]" -f (& $Label $Item), $L.ExeName, $mode) -Fore Cyan
+    Write-Message ("  source root: {0}" -f $srcRoot) -Fore DarkGray
+    Write-Message ("  output dir : {0}" -f $runDir) -Fore DarkGray
+    $dirNote = if ([string]::IsNullOrWhiteSpace($Dir)) { "" } else { "   dir: $Dir" }
+    Write-Message ("  file specs : {0}{1}" -f $FileSpec, $dirNote) -Fore DarkGray
+
+    # Compose the param-file content (the driver defaults recurse=yes).
+    $pfLines = @(
+        "# OECompiler parameter file - generated by OEAdmin -Compile",
+        "sourceroot = $srcRoot",
+        "filespecs = $FileSpec",
+        "recurse = yes",
+        "mode = $mode",
+        "logfile = $logFile",
+        ("listing = " + $(if ($Listing -eq $true) { "yes" } else { "no" })),
+        "listingdir = $listDir",
+        ("xref = " + $(if ($Xref -eq $true) { "yes" } else { "no" })),
+        "xrefdir = $xrefDir",
+        ("xrefxml = " + $(if ($XrefXml -eq $true) { "yes" } else { "no" })),
+        "statusfile = $statusFile"
+    )
+    if (-not [string]::IsNullOrWhiteSpace($Dir)) { $pfLines += "dir = $Dir" }
+
+    $outFile = Join-PathX $PSScriptRoot ("OECompiler_{0}.out" -f $stamp)
+    $errFile = Join-PathX $PSScriptRoot ("OECompiler_{0}.err" -f $stamp)
+
+    $cargs = @("-ininame", $L.Ini, "-pf", $L.Pf)
+    $dargs = @("-ininame", (Split-Path $L.Ini -Leaf), "-pf", (Split-Path $L.Pf -Leaf))
+    foreach ($ap in $L.AddPfs) { $cargs += @("-pf", $ap); $dargs += @("-pf", (Split-Path $ap -Leaf)) }
+    $cargs += @("-p", $driver, "-param", $paramFile, "-b")
+    $dargs += @("-p", "OECompiler.p", "-param", (Split-Path $paramFile -Leaf), "-b")
+
+    $display = "$($L.ExeName) " + ($dargs -join ' ')
+    if ($DryRun -eq $true) {
+        Write-Message ("  [DRYRUN] {0}  1> {1} 2> {2}" -f $display, (Split-Path $outFile -Leaf), (Split-Path $errFile -Leaf)) -Fore DarkGray
+        Write-Message  "  [DRYRUN] parameter file contents:" -Fore DarkGray
+        foreach ($pl in $pfLines) { Write-Message ("    " + $pl) -Fore DarkGray }
+        return
+    }
+
+    try {
+        $null = New-Item -ItemType Directory -Path $runDir -Force -ErrorAction Stop
+        if ($Listing -eq $true) { $null = New-Item -ItemType Directory -Path $listDir -Force -ErrorAction Stop }
+        if ($Xref    -eq $true) { $null = New-Item -ItemType Directory -Path $xrefDir -Force -ErrorAction Stop }
+        Set-Content -Path $paramFile -Value $pfLines -Encoding ascii -ErrorAction Stop
+    } catch {
+        Write-Message ("  Compile: could not create output dir / param file: {0}" -f $_.Exception.Message) -Fore Red
+        $script:OnError = $true; return
+    }
+
+    $workDir = Get-WorkspaceWorkDir -App $Item.App
+    Write-Message ("  {0}" -f $display) -Fore DarkGray
+    if ($workDir) { Write-Message ("  working dir: {0}" -f $workDir) -Fore DarkGray }
+
+    $prev = $env:DLC; $env:DLC = $Item.DLC
+    try {
+        $spArgs = @{ FilePath=$L.Exe; ArgumentList=$cargs; NoNewWindow=$true; Wait=$true; PassThru=$true;
+                     RedirectStandardOutput=$outFile; RedirectStandardError=$errFile }
+        if ($workDir) { $spArgs['WorkingDirectory'] = $workDir }
+        $p = Start-Process @spArgs
+
+        # The driver writes compile.status ("ERRORS=<n>"); -1 or a missing file
+        # means a setup/abort failure.  This - not $p.ExitCode (ABL QUIT has none) -
+        # is the authoritative pass/fail signal.
+        $errCount = -1
+        if (Test-Path -Path $statusFile -PathType Leaf) {
+            $m = (Get-Content -Path $statusFile -ErrorAction SilentlyContinue | Select-String -Pattern 'ERRORS=(-?\d+)')
+            if ($m) { $errCount = [int]$m.Matches[0].Groups[1].Value }
+        }
+
+        if ($errCount -eq 0) {
+            Write-Message  "  Compile completed clean (0 errors)." -Fore Green
+            Write-Message ("    log: {0}" -f $logFile) -Fore DarkGray
+        } elseif ($errCount -gt 0) {
+            Write-Message ("  COMPILE ERRORS detected ({0} file(s)).  Review the log:" -f $errCount) -Fore Red
+            Write-Message ("    {0}" -f $logFile) -Fore Red
+            Write-Message ("    driver summary: {0}" -f $outFile) -Fore Red
+            $script:OnError = $true
+        } else {
+            Write-Message ("  Compile did not complete (no status / setup error).  See:") -Fore Red
+            Write-Message ("    driver summary: {0}" -f $outFile) -Fore Red
+            Write-Message ("    driver errors : {0}" -f $errFile) -Fore Red
+            $script:OnError = $true
+        }
+    } catch {
+        Write-Message ("  ERROR running compile: {0}" -f $_.Exception.Message) -Fore Red
+        $script:OnError = $true
+    } finally {
+        $env:DLC = $prev
+        Remove-Item -Path $paramFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # ---- Binary file split / join (for large-backup copy) ------------------------
 # Split a big .bk into fixed-size slices so each piece copies independently (and
 # a failed piece can be retried) instead of restarting a multi-hour whole-file
@@ -2989,6 +3218,7 @@ function Invoke-Menu {
         [pscustomobject]@{ Label="CopyBackup - split+push prod backups -> dev (run on PROD)"; Value="CopyBackup" }
         [pscustomobject]@{ Label="Client     - launch Progress GUI client";           Value="Client" }
         [pscustomobject]@{ Label="Batch      - run a Progress program in batch";      Value="Batch" }
+        [pscustomobject]@{ Label="Compile    - compile app source (OECompiler.p)";    Value="Compile" }
         [pscustomobject]@{ Label="Git        - local repo/worktree maintenance";      Value="Git" }
     )
     if ($null -eq $action) { return $false }
@@ -2998,6 +3228,9 @@ function Invoke-Menu {
     $script:Status=$false; $script:Start=$false; $script:Stop=$false
     $script:Restart=$false; $script:Backup=$false; $script:Restore=$false
     $script:CopyBackup=$false; $script:Client=$false; $script:Batch=$false
+    $script:Compile=$false; $script:FileSpec="*.p *.w *.cls *.t"; $script:Dir=""
+    $script:Incremental=$false; $script:Listing=$false; $script:Xref=$false
+    $script:XrefXml=$false; $script:Installed=$false
     $script:AsyncCopy=$false; $script:Dest=""
     $script:Git=$false; $script:UpdateRepos=$false
     $script:NewWorkspace=$false; $script:BaseBranch=""; $script:NewBranch=""; $script:BootstrapClone=$false
@@ -3194,6 +3427,46 @@ function Invoke-Menu {
             & $askIniPfOverride
         }
 
+        "Compile" {
+            $script:Compile = $true
+            $app = & $askApp $false; if ($null -eq $app) { return $false }
+            $script:App = $app
+            if (-not (& $askClientEnv $app)) { return $false }
+
+            # Source: a git working copy (default) or the installed code.
+            $wcs = @(Get-WorkingCopies -App $app)
+            if ($wcs.Count -gt 0) {
+                $wsOpts = @()
+                foreach ($w in $wcs) { $wsOpts += [pscustomobject]@{ Label=("{0}  [{1}]" -f $w.Token, $w.Repo); Value=$w.Token; Valid=$true } }
+                $wsOpts += [pscustomobject]@{ Label="(installed code - -Installed)"; Value="__INSTALLED__"; Valid=$true }
+                $wsPick = Read-MenuChoice -Title "Compile which source?" -Options $wsOpts
+                if ($null -eq $wsPick) { return $false }
+                if ($wsPick -eq "__INSTALLED__") {
+                    $script:Installed = $true
+                } else {
+                    $script:Workspace = $wsPick
+                    $script:UpdateRepos = Read-YesNo -Prompt "Fast-forward (pull) this working copy before compiling?" -Default:$false
+                }
+            } else {
+                Write-Host "  No worktrees discovered - compiling the installed code." -ForegroundColor Yellow
+                $script:Installed = $true
+            }
+
+            $fsIn = Read-Host "  File spec(s) to compile [default: *.p *.w *.cls *.t]"
+            if (-not [string]::IsNullOrWhiteSpace($fsIn)) { $script:FileSpec = $fsIn.Trim() }
+
+            $dirIn = Read-Host "  Restrict to sub-directory (relative, Enter for all)"
+            if (-not [string]::IsNullOrWhiteSpace($dirIn)) { $script:Dir = $dirIn.Trim() }
+
+            $script:Incremental = Read-YesNo -Prompt "Incremental (only missing/newer-than-.r)?" -Default:$false
+            $script:Listing = Read-YesNo -Prompt "Generate per-file LISTING output?" -Default:$false
+            $script:Xref    = Read-YesNo -Prompt "Generate per-file XREF output?" -Default:$false
+            if ($script:Xref) {
+                $script:XrefXml = Read-YesNo -Prompt "  XREF in XML format?" -Default:$false
+            }
+            & $askIniPfOverride
+        }
+
         "Git" {
             $script:Git = $true
             # Two groups: everyday "day in the life" commands (operate in ONE working
@@ -3355,6 +3628,15 @@ function Invoke-Menu {
     if ($script:GitHelp -eq $true)                  { $parts += "-GitHelp" }
     if (-not [string]::IsNullOrWhiteSpace($script:RepoPath)) { $parts += "-RepoPath `"$($script:RepoPath)`"" }
     if (-not [string]::IsNullOrWhiteSpace($script:Pgm)) { $parts += "-Pgm $($script:Pgm)" }
+    if ($script:Compile -eq $true) {
+        if (-not [string]::IsNullOrWhiteSpace($script:FileSpec) -and $script:FileSpec -ne "*.p *.w *.cls *.t") { $parts += "-FileSpec `"$($script:FileSpec)`"" }
+        if (-not [string]::IsNullOrWhiteSpace($script:Dir)) { $parts += "-Dir `"$($script:Dir)`"" }
+        if ($script:Incremental -eq $true) { $parts += "-Incremental" }
+        if ($script:Listing -eq $true)     { $parts += "-Listing" }
+        if ($script:Xref -eq $true)        { $parts += "-Xref" }
+        if ($script:XrefXml -eq $true)     { $parts += "-XrefXml" }
+        if ($script:Installed -eq $true)   { $parts += "-Installed" }
+    }
     if (-not [string]::IsNullOrWhiteSpace($script:Ini)) { $parts += "-Ini `"$($script:Ini)`"" }
     if (-not [string]::IsNullOrWhiteSpace($script:Pf))  { $parts += "-Pf `"$($script:Pf)`"" }
     if (@($script:AddPfs).Count -gt 0) { $parts += "-AddPfs `"$(@($script:AddPfs) -join ',')`"" }
@@ -3515,6 +3797,7 @@ Write-Message "Actions:              Status=$Status Start=$Start Stop=$Stop Rest
 Write-Message "Backup actions:       Backup=$Backup Restore=$Restore CopyBackup=$CopyBackup" -Fore Blue
 Write-Message "Client action:        Client=$Client Run=$Run Ini='$Ini' Pf='$Pf'" -Fore Blue
 Write-Message "Batch action:         Batch=$Batch Pgm='$Pgm'" -Fore Blue
+Write-Message "Compile action:       Compile=$Compile FileSpec='$FileSpec' Dir='$Dir' Incremental=$Incremental Listing=$Listing Xref=$Xref XrefXml=$XrefXml Installed=$Installed" -Fore Blue
 Write-Message "Checks:               CheckAdminServer=$CheckAdminServer CheckPort=$CheckPort CheckLogErrors=$CheckLogErrors RestartOnError=$RestartOnError" -Fore Blue
 Write-Message "SettingsBackup:       SettingsBackup=$SettingsBackup ForceBackup=$ForceBackup" -Fore Blue
 Write-Message "DryRun / Menu:        DryRun=$DryRun Menu=$Menu" -Fore Blue
@@ -3864,6 +4147,33 @@ if ($Batch -eq $true) {
     $bt = @($bt | Group-Object { "{0}|{1}|{2}|{3}|{4}" -f $_.Server, $_.App, $_.Env, $_.Site, $_.DLC } |
                   ForEach-Object { $_.Group[0] })
     foreach ($t in $bt) { if (Test-CanAct -Item $t) { Do-Batch -Item $t } }
+}
+
+# COMPILE - headless Application Compiler run (OECompiler.p) for one environment.
+# Same target rules and launch machinery as -Batch (the INI/PF decide PROPATH and
+# DB connections; the -p program is the bundled compiler driver, not -Pgm).  Source
+# is the -Workspace worktree by default or the installed tree with -Installed.
+if ($Compile -eq $true) {
+    Write-Section "COMPILE (OECompiler.p via prowin/prowin32/_progres -b)"
+    # -UpdateRepos with a -Workspace: fast-forward the chosen working copy first.
+    if ($UpdateRepos -eq $true -and -not [string]::IsNullOrWhiteSpace($Workspace)) {
+        $wc = @(Get-WorkingCopies -App $App | Where-Object { $_.Token -ieq $Workspace })[0]
+        if ($wc) { Invoke-UpdateRepos -App $wc.App -OnlyRepo $wc.Repo -OnlyToken $wc.Token }
+    }
+
+    $pt = if (Test-ClientTargets -Tag "Compile") {
+        @($Targets | Where-Object { $_.Component -eq "Database" })
+    } else { @() }
+
+    if ($pt.Count -eq 0) {
+        Write-Message "  No valid target selected for -Compile (App1: -Site S1|S2 + -Env Dev|Test|SBox; App2: -Env Dev|Test|SBox; or pass -Ini and -Pf explicitly, or use -Remote)." -Fore Yellow
+    }
+    # One compile per environment, not per database (exe/ini/pf resolve from
+    # Server/App/Env/Site + DLC, so multiple dbs in an env would recompile the
+    # same source tree repeatedly).
+    $pt = @($pt | Group-Object { "{0}|{1}|{2}|{3}|{4}" -f $_.Server, $_.App, $_.Env, $_.Site, $_.DLC } |
+                  ForEach-Object { $_.Group[0] })
+    foreach ($t in $pt) { if (Test-CanAct -Item $t) { Do-Compile -Item $t } }
 }
 
 # NOTIFICATIONS - email + Windows EventLog on any error.
