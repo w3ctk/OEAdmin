@@ -92,7 +92,7 @@ as a Database with `Role="Extra"` and `Site`/`Env="All"`.
   `-OEVersion`, `-Component`.
 - **Actions** say what to do to the selection: `-Status` (default), `-Start`,
   `-Stop`, `-Restart`, `-Backup`, `-Restore`, `-CopyBackup`, `-Client`,
-  `-Batch`, `-Compile`, `-Package`, and the interactive `-Menu`.
+  `-Batch`, `-Compile`, `-Package`, `-Test`, and the interactive `-Menu`.
 
 ### 2.4 Tiers and the safety guard
 
@@ -594,6 +594,50 @@ Then on the target server, from the unzipped bundle:
 ./deploy.ps1 -TargetRoot /opt/app1 -Rollback -Stamp 2026-10-22_141530 -Execute
 ```
 
+### 7.9c `-Test` (ABLUnit test runner)
+
+`-Test` runs the **ABLUnit** suite headlessly. It's a `-Batch`-style launch whose
+`-p` program is the Progress driver **`ABLUnitCore.p`**, resolved off the **target
+environment's INI PROPATH** — the ablunit framework (`ABLUnitCore.p` +
+`OpenEdge.ABLUnit.*` + `OpenEdge.Core.*`) must be on that PROPATH. OEAdmin does
+**not** ship the framework; add it to the INI's `PROPATH=` where needed (exactly
+how `{includes}` and app classes resolve for `-Compile`/`-Batch`).
+
+```
+<exe> -ininame <ini> -pf <pf> -p ABLUnitCore.p -param "CFG=<generated.json>" -b
+```
+
+**OpenEdge 12+ only** — the shipped ABLUnit framework is 12-era OOABL, so a pre-12
+target is refused (checked per target).
+
+**What it runs (`-TestSpec`):** a test class/procedure (`Foo.cls` / `Foo.p`), a
+single method (`Foo.cls#MethodName`), a comma-separated list of those, or a test
+**folder**. Blank defaults to a **`tests`** folder under the source root (narrow
+with `-TestDir`); errors if neither it nor a spec exists. Source is the
+`-Workspace` worktree by default, or `-Installed`; same exe/INI/PF/App/Site/Env
+resolution as `-Compile`/`-Batch`.
+
+**How it reports:** OEAdmin writes a generated **config JSON** (passed as
+`CFG=<file>`) that pins the results location and `quitOnEnd`, runs blocking (driver
+out/err under `<script dir>/batch/ABLUnitCore/`), then parses the JUnit-style
+**`results.xml`** (`<testsuite tests= failures= errors= skipped=>`) and prints a
+loud **PASSED** / **TEST FAILURES** summary. Any failure/error — or a missing
+`results.xml` (which usually means the framework isn't on the INI PROPATH) — sets
+the test error state and the run **exits `2004`**. Results land under
+`<sourceroot>/x/<stamp>/test/` (or `-TestResults <dir>`).
+
+```bash
+# Run the default 'tests' folder of a worktree
+./OEAdmin.ps1 -Test -App App1 -Site S1 -Env Test -Workspace feature-x
+
+# One class, then a single method of it
+./OEAdmin.ps1 -Test -App App1 -Site S1 -Env Test -Workspace feature-x -TestSpec "tests/MyThingTest.cls"
+./OEAdmin.ps1 -Test -App App1 -Site S1 -Env Test -Workspace feature-x -TestSpec "MyThingTest.cls#HappyPath"
+
+# A sub-dir of the default tests folder, custom results location
+./OEAdmin.ps1 -Test -App App1 -Site S1 -Env Test -Workspace feature-x -TestDir tests/data -TestResults /tmp/testout
+```
+
 ### 7.10 `-Git` (local repo/worktree maintenance)
 
 `-Git` is an extensible action group for git work. It has two **maintenance**
@@ -842,6 +886,9 @@ Package (release bundler): `-Package`, `-Project` (required with `-Accept`),
 `-Grep` / `-FromCommit` / `-ToCommit` / `-FileList` (change-set inputs), `-Full`,
 `-Accept`, `-DeltaDf`, `-DfLoadedConfirmed`, `-PackageBackupDir`.
 
+Test (ABLUnit, OpenEdge 12+): `-Test`, `-TestSpec` (class/proc / `Foo.cls#Method`
+/ comma-list / folder; blank = a `tests` folder), `-TestDir`, `-TestResults`.
+
 Client tools & workspaces: `-Tool` (named entry from the `$Tools` map),
 `-Workspace` (launch from a git working copy), `-Run`/`-Editor`/`-AppBuilder`/
 `-Desktop`/`-Dict`/`-Admin` (aliases for `$Tools` entries).
@@ -883,6 +930,7 @@ in the `param()` block.
 | `2001` | A general error occurred (`OnError`). |
 | `2002` | A database log error was found (`OnLogError`). |
 | `2003` | A broker port was not listening (`OnPortError`). |
+| `2004` | `-Test` had a test failure/error, or no `results.xml` was produced (`OnTestError`). |
 
 ---
 

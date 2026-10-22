@@ -277,6 +277,26 @@ the required `-Site`/`-Env` — is automatic. Delta schema files passed with
 steps and awaits confirmation; it never loads a `.df` itself, so no DB credentials
 live in the bundle.
 
+### Topic 15 — Test (`-Test`) — one PROPATH requirement
+
+*(Informational — no interview questions.)* `-Test` runs the **ABLUnit** suite
+headlessly via the Progress driver `ABLUnitCore.p`. Like `-Compile`, it reuses the
+`-Client`/`-Batch` exe/INI/PF resolution, so it needs almost no customization. The
+**one** requirement: the ABLUnit framework — `ABLUnitCore.p` plus the
+`OpenEdge.ABLUnit.*` / `OpenEdge.Core.*` classes — must be on the target
+environment's **INI `PROPATH`**. OEAdmin does **not** ship the framework; it comes
+with OpenEdge (Developer Studio ships it, and it's available in the product's
+`src/ablunit` tree). Add that path to the INI `PROPATH=` for each environment you
+want to test in (the same place your app's own `{includes}`/classes resolve).
+
+`-Test` is **OpenEdge 12+ only** (the framework is 12-era OOABL); a pre-12 target
+is refused automatically. The test spec is `-TestSpec` (a class/proc,
+`Foo.cls#Method`, a comma-list, or a folder; blank = a `tests` folder under the
+source root). OEAdmin writes a generated config JSON, runs the suite, and parses
+the `results.xml` it produces — if that file is missing, the most common cause is
+the framework not being on the INI PROPATH, which OEAdmin reports explicitly. A
+test failure/error (or a missing `results.xml`) sets exit `2004`.
+
 ---
 
 ## Part 3 — After customizing

@@ -11,10 +11,11 @@ broker ports, backs up your `conmgr`/`ubroker` properties before state changes,
 runs light **git** worktree maintenance plus everyday-git helpers for the git-shy
 (`-Git -UpdateRepos` / `-NewWorkspace` / `-GitStatus` / `-GitCommit` / `-GitPush` / `-GitHelp`), and can email a
 log/alert. It also has a headless **application compiler** (`-Compile`, via the
-bundled `OECompiler.p`) and a **release bundler** (`-Package`) that packages one
+bundled `OECompiler.p`), a **release bundler** (`-Package`) that packages one
 project's changed source plus its dependency-aware r-code into a versioned zip
-with a safe `deploy.ps1`. It also has an interactive `-Menu` so operators don't
-have to memorize switches.
+with a safe `deploy.ps1`, and an **ABLUnit test runner** (`-Test`, OpenEdge 12+)
+that runs the suite headlessly and reports pass/fail from `results.xml`. It also
+has an interactive `-Menu` so operators don't have to memorize switches.
 
 `-CopyBackup` runs on the **production** server and **pushes** backups to a named
 share on the dev server; large `.bk` files are binary-**split** into slices
@@ -210,6 +211,10 @@ shared components (NameServer / MSSQLBroker / OracleBroker) it actually runs.
 ./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace my-feature-branch -Grep "TICKET-123"
 # Pass 2 - accept the reviewed set (re-hashes; hard-stops on drift) and build the zip
 ./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace my-feature-branch -Grep "TICKET-123" -Accept -Project TICKET-123
+
+# Run the ABLUnit suite (OpenEdge 12+); default 'tests' folder, or a specific class/method
+./OEAdmin.ps1 -Test -App App1 -Site S1 -Env Test -Workspace my-feature-branch
+./OEAdmin.ps1 -Test -App App1 -Site S1 -Env Test -Workspace my-feature-branch -TestSpec "tests/MyThingTest.cls#HappyPath"
 
 # Fast-forward every mapped repo's worktrees (fetch + merge --ff-only), standalone
 ./OEAdmin.ps1 -Git -UpdateRepos

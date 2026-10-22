@@ -1,6 +1,6 @@
 <#PSScriptInfo
 
-.VERSION 1.4.0
+.VERSION 1.5.0
 
 .AUTHOR
 
@@ -95,6 +95,21 @@ You may obtain a copy of the License at
         deploy.ps1 is dry-run by default (-Execute to apply), backs up each target
         before overwrite, and has a -Rollback.  LOCAL worktree only (-Remote
         refused).  -DryRun throughout.  Wired into -Menu.
+
+1.5.0 - Added -Test: run the ABLUnit suite headlessly.  A -Batch-style launch
+        whose "-p" program is the Progress driver ABLUnitCore.p, resolved off the
+        ENVIRONMENT's INI PROPATH (the ablunit framework must be on that PROPATH;
+        add it to the INI where needed - OEAdmin does not ship it).  The test spec
+        comes from -TestSpec (a class/proc, Foo.cls#Method, a comma-list, or a
+        folder); blank defaults to a "tests" folder under the source root (narrow
+        with -TestDir).  Same exe/INI/PF/App/Site/Env/Workspace/Installed machinery
+        as -Compile/-Batch.  OEAdmin writes a generated CONFIG json (CFG=<file>)
+        pinning the results location + quitOnEnd, runs blocking (driver out/err
+        under <script dir>/batch/ABLUnitCore/), then PARSES the JUnit-style
+        results.xml (-TestResults dir, default <sourceroot>/x/<stamp>/test/) and
+        prints a pass/fail summary.  Any failure/error - or a missing results.xml
+        (usually the framework not on PROPATH) - sets OnTestError and exit 2004.
+        OpenEdge 12+ ONLY (9.1E/10.2B targets are refused).  Wired into -Menu.
 
 #>
 
@@ -221,6 +236,15 @@ ACTIONS:
                  HARD-STOPS on drift before building.  deploy.ps1 is dry-run by
                  default (-Execute to apply), backs up before overwrite, -Rollback
                  restores.  LOCAL worktree only (-Remote refused).
+    -Test        Run the ABLUnit suite headlessly via the Progress driver
+                 ABLUnitCore.p (resolved off the environment's INI PROPATH).  Same
+                 launch machinery as -Compile/-Batch.  -TestSpec picks what to run
+                 (class/proc, Foo.cls#Method, comma-list, or folder; blank = a
+                 "tests" folder under the source root, narrow with -TestDir).
+                 OEAdmin writes a CONFIG json, runs blocking, then parses the
+                 results.xml (-TestResults dir) and prints a pass/fail summary; any
+                 failure/error (or a missing results.xml) sets exit 2004.  OpenEdge
+                 12+ ONLY.
 
 Backup / restore safety model:
     A server Tier (Production vs Development) is attached to every install.
@@ -312,6 +336,19 @@ Usage examples (all switches shown; App/Site/Env names are placeholders):
 
     # ...preview the whole run (resolve + compile launch) without building
     ./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace feature-x -Grep "TICKET-123" -Accept -Project TICKET-123 -DryRun
+
+    # Test (ABLUnit, OpenEdge 12+ only) - run the default 'tests' folder of a worktree
+    ./OEAdmin.ps1 -Test -App App1 -Site S1 -Env Test -Workspace feature-x
+
+    # ...one test class, or a single method of it
+    ./OEAdmin.ps1 -Test -App App1 -Site S1 -Env Test -Workspace feature-x -TestSpec "tests/MyThingTest.cls"
+    ./OEAdmin.ps1 -Test -App App1 -Site S1 -Env Test -Workspace feature-x -TestSpec "MyThingTest.cls#HappyPath"
+
+    # ...a sub-dir of the default tests folder, custom results location
+    ./OEAdmin.ps1 -Test -App App1 -Site S1 -Env Test -Workspace feature-x -TestDir tests/data -TestResults /tmp/testout
+
+    # ...preview the launch + CFG json without running
+    ./OEAdmin.ps1 -Test -App App1 -Site S1 -Env Test -Workspace feature-x -DryRun
 
     # Status of ALL servers from one box, over the network (files + -host <server>)
     ./OEAdmin.ps1 -Remote
@@ -703,6 +740,27 @@ param (
     # deploy.ps1 (its backup-before-overwrite root).  Blank = the App1 backup dir.
     $PackageBackupDir="",
 
+    ##### ---- TEST (-Test : ABLUnit) -----------------------------------------
+    # -Test: run the ABLUnit suite headlessly via the Progress driver
+    # ABLUnitCore.p (resolved off the environment's INI PROPATH - the ablunit
+    # framework must be on that PROPATH; add it to the INI where needed).  Same
+    # launch machinery as -Batch/-Compile.  OpenEdge 12+ ONLY.
+    [switch]$Test,
+
+    # -TestSpec: what to run - a test class/procedure (Foo.cls / Foo.p), a single
+    # method (Foo.cls#MethodName), a comma-separated list of those, or a test
+    # FOLDER (full or relative path).  Blank = a "tests" folder under the source
+    # root (narrowed by -TestDir if given); errors if neither exists.
+    $TestSpec="",
+
+    # -TestDir: restrict the default test-folder spec to this sub-directory
+    # (relative to the source root).  Ignored when -TestSpec is given.
+    $TestDir="",
+
+    # -TestResults: directory for the ABLUnit results.xml.  Blank = the per-run
+    # tree <sourceroot>/x/<stamp>/test/.
+    $TestResults="",
+
     # The startup program appended by -Run (and the menu's "run startup?" prompt).
     # CHANGE THIS to your own startup .p if you use one.
     $StartupProgram="sh/startup.p",
@@ -950,6 +1008,7 @@ $SettleDelay = 5
 $OnError    = $false
 $OnLogError = $false
 $OnPortError= $false
+$OnTestError= $false   # -Test: a test failure/error (or missing results.xml) -> exit 2004
 
 # True when running on Windows (works in both Windows PowerShell 5.1 and pwsh 7).
 # On PowerShell 7+ the automatic $IsWindows exists; on 5.1 it does not, so we
@@ -3594,6 +3653,193 @@ if (`$Execute) {
 "@
 }
 
+## ============================================================================
+## TEST  (-Test : run the ABLUnit suite headlessly via ABLUnitCore.p)
+## ============================================================================
+# -Test is a -Batch-style launch whose "-p" program is the Progress ABLUnit driver
+# ABLUnitCore.p, resolved off the ENVIRONMENT's INI PROPATH (the ablunit framework
+# - OpenEdge.ABLUnit.* + ABLUnitCore.p - must be on that PROPATH; add it to the INI
+# where needed; OEAdmin does not ship it).  The test spec travels in a generated
+# CONFIG JSON (CFG=<file>) - the JSON pins the results output location and quitOnEnd
+# and sidesteps the space-splitting the raw "-param <spec>" form suffers:
+#   <exe> -ininame <ini> -pf <pf> -p ABLUnitCore.p -param "CFG=<cfg.json>" -b
+# ABLUnitCore QUITs with no OS exit code, so the authoritative pass/fail signal is
+# the JUnit-style results.xml it writes; OEAdmin parses it, prints a loud summary,
+# and sets exit 2004 on any failure/error (or a missing results.xml, which usually
+# means the framework is not on PROPATH).  12+ ONLY (the framework is 12-era).
+function Do-Test {
+    param($Item)
+
+    # 12+ only: the ABLUnit framework (OpenEdge.ABLUnit.*) is 12-era OOABL.
+    $major = 0
+    if ($Item.OEVersion -match '^(\d+)') { $major = [int]$Matches[1] }
+    if ($major -lt 12) {
+        Write-Message ("  Test: -Test requires OpenEdge 12+; target {0} is {1}. Skipped." -f $Item.Name, $Item.OEVersion) -Fore Red
+        $script:OnError = $true; return
+    }
+
+    $L = Resolve-ClientLaunch -Item $Item -Tag "Test"
+    if (-not $L) { return }
+
+    # Source root (worktree or installed tree) - same resolution as -Compile.
+    $srcRoot = Get-CompileSourceRoot -Item $Item
+    if (-not $srcRoot) {
+        Write-Message ("  Test: could not resolve a source root for {0}" -f $Item.Name) -Fore Red
+        $script:OnError = $true; return
+    }
+
+    # Resolve the test spec.  Explicit -TestSpec wins (a class/proc, Foo.cls#Method,
+    # a comma-list, or a folder).  Otherwise default to a "tests" folder under the
+    # source root (optionally narrowed by -TestDir).  Fail if neither exists.
+    $spec = ""
+    if (-not [string]::IsNullOrWhiteSpace($TestSpec)) {
+        $spec = $TestSpec.Trim()
+    } else {
+        $testRoot = if (-not [string]::IsNullOrWhiteSpace($TestDir)) {
+            Join-PathX $srcRoot ($TestDir -replace '/','\')
+        } else {
+            Join-PathX $srcRoot "tests"
+        }
+        if ($DryRun -ne $true -and -not (Test-Path -Path $testRoot)) {
+            Write-Message ("  Test: no test spec given and default test folder not found: {0}" -f $testRoot) -Fore Red
+            Write-Message  "        Pass -TestSpec <class|proc|folder|Foo.cls#Method> or create a 'tests' folder (or use -TestDir)." -Fore Red
+            $script:OnError = $true; return
+        }
+        $spec = $testRoot
+    }
+
+    # Per-run output tree under <sourceroot>/x/<stamp>/test/ (or -TestResults).
+    $stamp      = [DateTime]::Now.ToString("yyyy-MM-dd_HHmmss")
+    $resultsDir = if (-not [string]::IsNullOrWhiteSpace($TestResults)) { $TestResults } `
+                  else { Join-PathX (Join-PathX (Join-PathX $srcRoot "x") $stamp) "test" }
+    $resultsXml = Join-PathX $resultsDir "results.xml"
+    # Transient CFG json consumed by ABLUnitCore.p (CFG=<file>).
+    $cfgFile    = Join-PathX $PSScriptRoot ("abltest_{0}.cfg.json" -f $stamp)
+
+    # Build the ABLUnit config JSON.  "tests" is an array of {test:<resource>}
+    # (optionally {cases:[...]} for a Foo.cls#Method form); options pin the xml
+    # output location + quitOnEnd so the batch session exits when done.
+    $testsJson = @()
+    foreach ($one in ($spec -split ',')) {
+        $one = $one.Trim()
+        if ([string]::IsNullOrWhiteSpace($one)) { continue }
+        if ($one -match '^(.*)#(.+)$') {
+            $testsJson += [PSCustomObject]@{ test = $Matches[1]; cases = @($Matches[2]) }
+        } else {
+            $testsJson += [PSCustomObject]@{ test = $one }
+        }
+    }
+    if ($testsJson.Count -eq 0) {
+        Write-Message "  Test: empty test spec after parsing." -Fore Red
+        $script:OnError = $true; return
+    }
+    $cfgObj = [PSCustomObject]@{
+        options = [PSCustomObject]@{
+            output    = [PSCustomObject]@{ location = $resultsDir; format = "xml"; fileName = "results" }
+            quitOnEnd = $true
+            writeLog  = $false
+            throwError= $false
+        }
+        tests = @($testsJson)
+    }
+
+    # Driver stdout/err grouped under <script dir>/batch/ABLUnitCore/.
+    $pgmDir  = Join-PathX (Join-PathX $PSScriptRoot "batch") "ABLUnitCore"
+    if ($DryRun -ne $true) { $null = New-Item -ItemType Directory -Path $pgmDir -Force -ErrorAction SilentlyContinue }
+    $outFile = Join-PathX $pgmDir ("ABLUnitCore_{0}.out" -f $stamp)
+    $errFile = Join-PathX $pgmDir ("ABLUnitCore_{0}.err" -f $stamp)
+
+    $cargs = @("-ininame", $L.Ini, "-pf", $L.Pf)
+    $dargs = @("-ininame", (Split-Path $L.Ini -Leaf), "-pf", (Split-Path $L.Pf -Leaf))
+    foreach ($ap in $L.AddPfs) { $cargs += @("-pf", $ap); $dargs += @("-pf", (Split-Path $ap -Leaf)) }
+    $cargs += @("-p", "ABLUnitCore.p", "-param", ("CFG=" + $cfgFile), "-b")
+    $dargs += @("-p", "ABLUnitCore.p", "-param", ("CFG=" + (Split-Path $cfgFile -Leaf)), "-b")
+
+    $display = "$($L.ExeName) " + ($dargs -join ' ')
+    Write-Message ("Test: {0,-40} {1}" -f (& $Label $Item), $L.ExeName) -Fore Cyan
+    Write-Message ("  source root : {0}" -f $srcRoot) -Fore DarkGray
+    Write-Message ("  test spec   : {0}" -f $spec) -Fore DarkGray
+    Write-Message ("  results     : {0}" -f $resultsXml) -Fore DarkGray
+
+    if ($DryRun -eq $true) {
+        Write-Message ("  [DRYRUN] {0}  1> {1} 2> {2}" -f $display, (Split-Path $outFile -Leaf), (Split-Path $errFile -Leaf)) -Fore DarkGray
+        Write-Message  "  [DRYRUN] CFG json contents:" -Fore DarkGray
+        foreach ($cl in (($cfgObj | ConvertTo-Json -Depth 6) -split "`n")) { Write-Message ("    " + $cl.TrimEnd()) -Fore DarkGray }
+        return
+    }
+
+    try {
+        $null = New-Item -ItemType Directory -Path $resultsDir -Force -ErrorAction Stop
+        Set-Content -Path $cfgFile -Value ($cfgObj | ConvertTo-Json -Depth 6) -Encoding ascii -ErrorAction Stop
+    } catch {
+        Write-Message ("  Test: could not create results dir / CFG file: {0}" -f $_.Exception.Message) -Fore Red
+        $script:OnError = $true; return
+    }
+
+    # Remove any stale results.xml so a crash can't leave a prior pass showing.
+    Remove-Item -Path $resultsXml -Force -ErrorAction SilentlyContinue
+
+    $workDir = Get-WorkspaceWorkDir -App $Item.App
+    Write-Message ("  {0}" -f $display) -Fore DarkGray
+    if ($workDir) { Write-Message ("  working dir: {0}" -f $workDir) -Fore DarkGray }
+
+    $prev = $env:DLC; $env:DLC = $Item.DLC
+    try {
+        $spArgs = @{ FilePath=$L.Exe; ArgumentList=$cargs; NoNewWindow=$true; Wait=$true; PassThru=$true;
+                     RedirectStandardOutput=$outFile; RedirectStandardError=$errFile }
+        if ($workDir) { $spArgs['WorkingDirectory'] = $workDir }
+        $p = Start-Process @spArgs
+
+        # ABLUnitCore QUITs with no meaningful OS code; results.xml is authoritative.
+        if (-not (Test-Path -Path $resultsXml -PathType Leaf)) {
+            Write-Message  "  Test: no results.xml produced - the run did not complete." -Fore Red
+            Write-Message  "        Likely the ABLUnit framework (ABLUnitCore.p / OpenEdge.ABLUnit.*) is not on this environment's INI PROPATH." -Fore Red
+            Write-Message ("        driver summary: {0}" -f $outFile) -Fore Red
+            Write-Message ("        driver errors : {0}" -f $errFile) -Fore Red
+            $script:OnTestError = $true
+            return
+        }
+
+        # Parse the JUnit-style results.xml: sum tests/failures/errors across suites.
+        $tests = 0; $failures = 0; $errors = 0; $skipped = 0
+        try {
+            [xml]$rx = Get-Content -Path $resultsXml -Raw -ErrorAction Stop
+            # <testsuites> wrapping <testsuite>, or a single <testsuite>.
+            $suites = @()
+            if ($rx.testsuites -and $rx.testsuites.testsuite) { $suites = @($rx.testsuites.testsuite) }
+            elseif ($rx.testsuite) { $suites = @($rx.testsuite) }
+            foreach ($s in $suites) {
+                if ($s.tests)    { $tests    += [int]$s.tests }
+                if ($s.failures) { $failures += [int]$s.failures }
+                if ($s.errors)   { $errors   += [int]$s.errors }
+                if ($s.skipped)  { $skipped  += [int]$s.skipped }
+            }
+        } catch {
+            Write-Message ("  Test: could not parse results.xml ({0})." -f $_.Exception.Message) -Fore Red
+            Write-Message ("        results: {0}" -f $resultsXml) -Fore Red
+            $script:OnTestError = $true
+            return
+        }
+
+        $passed = $tests - $failures - $errors - $skipped
+        if ($failures -eq 0 -and $errors -eq 0) {
+            Write-Message ("  Tests PASSED: {0} run, {1} passed{2}." -f $tests, $passed, $(if ($skipped) { ", $skipped skipped" } else { "" })) -Fore Green
+            Write-Message ("    results: {0}" -f $resultsXml) -Fore DarkGray
+        } else {
+            Write-Message ("  TEST FAILURES: {0} run, {1} failed, {2} error(s){3}.  Review:" -f $tests, $failures, $errors, $(if ($skipped) { ", $skipped skipped" } else { "" })) -Fore Red
+            Write-Message ("    results: {0}" -f $resultsXml) -Fore Red
+            Write-Message ("    driver : {0}" -f $outFile) -Fore Red
+            $script:OnTestError = $true
+        }
+    } catch {
+        Write-Message ("  ERROR running tests: {0}" -f $_.Exception.Message) -Fore Red
+        $script:OnError = $true
+    } finally {
+        $env:DLC = $prev
+        Remove-Item -Path $cfgFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # ---- Binary file split / join (for large-backup copy) ------------------------
 # Split a big .bk into fixed-size slices so each piece copies independently (and
 # a failed piece can be retried) instead of restarting a multi-hour whole-file
@@ -4188,6 +4434,7 @@ function Invoke-Menu {
         [pscustomobject]@{ Label="Batch      - run a Progress program in batch";      Value="Batch" }
         [pscustomobject]@{ Label="Compile    - compile app source (OECompiler.p)";    Value="Compile" }
         [pscustomobject]@{ Label="Package    - build a release bundle (source+rcode+manifest)"; Value="Package" }
+        [pscustomobject]@{ Label="Test       - run the ABLUnit suite (12+)";          Value="Test" }
         [pscustomobject]@{ Label="Git        - local repo/worktree maintenance";      Value="Git" }
     )
     if ($null -eq $action) { return $false }
@@ -4205,6 +4452,7 @@ function Invoke-Menu {
     $script:FromCommit=""; $script:ToCommit=""; $script:FileList=""
     $script:Accept=$false; $script:DeltaDf=@(); $script:DfLoadedConfirmed=$false
     $script:Full=$false; $script:PackageBackupDir=""
+    $script:Test=$false; $script:TestSpec=""; $script:TestDir=""; $script:TestResults=""
     $script:AsyncCopy=$false; $script:Dest=""
     $script:Git=$false; $script:UpdateRepos=$false
     $script:NewWorkspace=$false; $script:BaseBranch=""; $script:NewBranch=""; $script:BootstrapClone=$false
@@ -4520,6 +4768,47 @@ function Invoke-Menu {
             $script:Accept = Read-YesNo -Prompt "Accept and BUILD now? (No = resolve + review only)" -Default:$false
         }
 
+        "Test" {
+            $script:Test = $true
+            # App + required Site/Env (same as Compile/Client/Batch).  12+ only, but
+            # the version gate is enforced per-target in Do-Test, not here.
+            $app = & $askApp $false; if ($null -eq $app) { return $false }
+            $script:App = $app
+            if (-not (& $askClientEnv $app)) { return $false }
+
+            # Source: a git working copy (default) or the installed code.
+            $wcs = @(Get-WorkingCopies -App $app)
+            if ($wcs.Count -gt 0) {
+                $wsOpts = @()
+                foreach ($w in $wcs) { $wsOpts += [pscustomobject]@{ Label=("{0}  [{1}]" -f $w.Token, $w.Repo); Value=$w.Token; Valid=$true } }
+                $wsOpts += [pscustomobject]@{ Label="(installed code - -Installed)"; Value="__INSTALLED__"; Valid=$true }
+                $wsPick = Read-MenuChoice -Title "Test which source?" -Options $wsOpts
+                if ($null -eq $wsPick) { return $false }
+                if ($wsPick -eq "__INSTALLED__") {
+                    $script:Installed = $true
+                } else {
+                    $script:Workspace = $wsPick
+                    $script:UpdateRepos = Read-YesNo -Prompt "Fast-forward (pull) this working copy before testing?" -Default:$false
+                }
+            } else {
+                Write-Host "  No worktrees discovered - testing the installed code." -ForegroundColor Yellow
+                $script:Installed = $true
+            }
+
+            # Test spec: a class/proc/folder/Foo.cls#Method, or Enter for the
+            # default "tests" folder under the source root.
+            $tsIn = (Read-Host "  Test spec - class/proc, Foo.cls#Method, comma-list, or folder (Enter = 'tests' folder)").Trim()
+            if (-not [string]::IsNullOrWhiteSpace($tsIn)) { $script:TestSpec = $tsIn }
+            else {
+                $tdIn = (Read-Host "  Restrict the default 'tests' folder to sub-directory (Enter for all)").Trim()
+                if (-not [string]::IsNullOrWhiteSpace($tdIn)) { $script:TestDir = $tdIn }
+            }
+            $trIn = (Read-Host "  Results directory (Enter = <sourceroot>/x/<stamp>/test)").Trim()
+            if (-not [string]::IsNullOrWhiteSpace($trIn)) { $script:TestResults = $trIn }
+
+            & $askIniPfOverride
+        }
+
         "Git" {
             $script:Git = $true
             # Two groups: everyday "day in the life" commands (operate in ONE working
@@ -4705,6 +4994,12 @@ function Invoke-Menu {
         if (-not [string]::IsNullOrWhiteSpace($script:PackageBackupDir)) { $parts += "-PackageBackupDir `"$($script:PackageBackupDir)`"" }
         if ($script:Installed -eq $true)   { $parts += "-Installed" }
     }
+    if ($script:Test -eq $true) {
+        if (-not [string]::IsNullOrWhiteSpace($script:TestSpec))    { $parts += "-TestSpec `"$($script:TestSpec)`"" }
+        if (-not [string]::IsNullOrWhiteSpace($script:TestDir))     { $parts += "-TestDir `"$($script:TestDir)`"" }
+        if (-not [string]::IsNullOrWhiteSpace($script:TestResults)) { $parts += "-TestResults `"$($script:TestResults)`"" }
+        if ($script:Installed -eq $true)   { $parts += "-Installed" }
+    }
     if (-not [string]::IsNullOrWhiteSpace($script:Ini)) { $parts += "-Ini `"$($script:Ini)`"" }
     if (-not [string]::IsNullOrWhiteSpace($script:Pf))  { $parts += "-Pf `"$($script:Pf)`"" }
     if (@($script:AddPfs).Count -gt 0) { $parts += "-AddPfs `"$(@($script:AddPfs) -join ',')`"" }
@@ -4815,7 +5110,7 @@ if ($Menu -eq $true) {
 # exactly one action, so this is a no-op there; this covers the CLI.)
 if (-not $PSBoundParameters.ContainsKey('Status')) {
     $otherAction = $Start -or $Stop -or $Restart -or $Backup -or $Restore -or
-                   $CopyBackup -or $Client -or $Batch -or $Compile -or $Package -or $Git
+                   $CopyBackup -or $Client -or $Batch -or $Compile -or $Package -or $Test -or $Git
     if ($otherAction) { $Status = $false }
 }
 
@@ -4881,6 +5176,7 @@ Write-Message "Compile action:       Compile=$Compile FileSpec='$FileSpec' Dir='
 Write-Message "Compile excludes:     Exclude='$(@($Exclude) -join ',')' ExcludeFile='$ExcludeFile'" -Fore Blue
 Write-Message "Package action:       Package=$Package Project='$Project' Accept=$Accept Full=$Full DfLoadedConfirmed=$DfLoadedConfirmed" -Fore Blue
 Write-Message "Package change-set:   Grep='$Grep' FromCommit='$FromCommit' ToCommit='$ToCommit' FileList='$FileList' DeltaDf='$(@($DeltaDf) -join ',')'" -Fore Blue
+Write-Message "Test action:          Test=$Test TestSpec='$TestSpec' TestDir='$TestDir' TestResults='$TestResults'" -Fore Blue
 Write-Message "Checks:               CheckAdminServer=$CheckAdminServer CheckPort=$CheckPort CheckLogErrors=$CheckLogErrors RestartOnError=$RestartOnError" -Fore Blue
 Write-Message "SettingsBackup:       SettingsBackup=$SettingsBackup ForceBackup=$ForceBackup" -Fore Blue
 Write-Message "DryRun / Menu:        DryRun=$DryRun Menu=$Menu" -Fore Blue
@@ -5286,9 +5582,34 @@ if ($Package -eq $true) {
     foreach ($t in $pkgt) { if (Test-CanAct -Item $t) { Do-Package -Item $t } }
 }
 
+# TEST - run the ABLUnit suite headlessly (ABLUnitCore.p via CFG json) for one
+# environment.  Same target rules / launch machinery as -Compile/-Batch.  12+
+# ONLY (the framework is 12-era).  Test failures set OnTestError (exit 2004).
+if ($Test -eq $true) {
+    Write-Section "TEST (ABLUnit via ABLUnitCore.p -b)"
+    # -UpdateRepos with a -Workspace: fast-forward the chosen working copy first.
+    if ($UpdateRepos -eq $true -and -not [string]::IsNullOrWhiteSpace($Workspace)) {
+        $wc = @(Get-WorkingCopies -App $App | Where-Object { $_.Token -ieq $Workspace })[0]
+        if ($wc) { Invoke-UpdateRepos -App $wc.App -OnlyRepo $wc.Repo -OnlyToken $wc.Token }
+    }
+
+    # Same environment selection as -Compile/-Batch.
+    $tt = if (Test-ClientTargets -Tag "Test") {
+        @($Targets | Where-Object { $_.Component -eq "Database" })
+    } else { @() }
+
+    if ($tt.Count -eq 0) {
+        Write-Message "  No valid target selected for -Test (App1: -Site S1|S2 + -Env Dev|Test|SBox; App2: -Env Dev|Test|SBox; or pass -Ini and -Pf explicitly).  OpenEdge 12+ only." -Fore Yellow
+    }
+    # One test run per environment (exe/ini/pf resolve per env; see -Compile note).
+    $tt = @($tt | Group-Object { "{0}|{1}|{2}|{3}|{4}" -f $_.Server, $_.App, $_.Env, $_.Site, $_.DLC } |
+                  ForEach-Object { $_.Group[0] })
+    foreach ($t in $tt) { if (Test-CanAct -Item $t) { Do-Test -Item $t } }
+}
+
 # NOTIFICATIONS - email + Windows EventLog on any error.
-if ($OnError -eq $true -or $OnLogError -eq $true -or $OnPortError -eq $true) {
-    $summary = "OEAdmin run had errors. OnError=$OnError OnLogError=$OnLogError OnPortError=$OnPortError. See $LogFile."
+if ($OnError -eq $true -or $OnLogError -eq $true -or $OnPortError -eq $true -or $OnTestError -eq $true) {
+    $summary = "OEAdmin run had errors. OnError=$OnError OnLogError=$OnLogError OnPortError=$OnPortError OnTestError=$OnTestError. See $LogFile."
     if ($EmailOnError -eq $true) {
         Send-Email-Error -Subject "OEAdmin - ERROR" -Body $summary
     }
@@ -5296,7 +5617,7 @@ if ($OnError -eq $true -or $OnLogError -eq $true -or $OnPortError -eq $true) {
 }
 
 # Email the full log when requested, or whenever an error occurred.
-if ($LogFileEmail -eq $true -or (($OnError -eq $true -or $OnLogError -eq $true -or $OnPortError -eq $true) -and $EmailOnError -eq $true)) {
+if ($LogFileEmail -eq $true -or (($OnError -eq $true -or $OnLogError -eq $true -or $OnPortError -eq $true -or $OnTestError -eq $true) -and $EmailOnError -eq $true)) {
     Send-Email-Log -Subject "OEAdmin - Run Log"
 }
 
@@ -5305,6 +5626,7 @@ Write-Section "SCRIPT COMPLETED"
 if ($OnError -eq $true)     { exit 2001 }
 if ($OnLogError -eq $true)  { exit 2002 }
 if ($OnPortError -eq $true) { exit 2003 }
+if ($OnTestError -eq $true) { exit 2004 }
 exit 0
 
 ## ============================================================================
