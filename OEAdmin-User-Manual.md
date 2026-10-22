@@ -63,10 +63,11 @@ is **one OpenEdge install** and carries:
 | `InstallDir` | The install **root** (e.g. `/opt/app1`). This is what appears in the master INI's `PROPATH`, so the `-Workspace` launch rewrites `InstallDir` → the chosen worktree's app folder. Per install, not global. |
 | `SetupDir`  | Root of this install's `-Client`/`-Batch` INI/PF tree, always `<InstallDir>/setup` (INI under `<SetupDir>/ini/<server>/`, PF under `<SetupDir>/userPfs/<server>/`). Per install, not global, because the root can differ by machine **and** OE version. |
 | `InstalledComponents` | Allowlist of shared components this install runs: any of `"NameServer"` / `"MSSQLBroker"` / `"OracleBroker"`, or `@()` for none. Gates which components `-Start`/`-Stop`/`-Restart` touch (see §7); databases ignore it. Per install/AdminServer. |
+| `ExtraDatabases` | Allowlist of **exact** names of extra databases this install's AdminServer manages that are **not** application databases (so the name-parser skips them) but that you still want inventoried — e.g. a schema-holder DB. Each listed DB becomes a Database row with `Role="Extra"` and `Site`/`Env="All"`, tagged with this install's `App`. Case-insensitive match; `@()` (default) means none. Per install/AdminServer. |
 
 A single server can appear in several rows (for example, two OpenEdge versions
 installed side by side on different DLC paths and ports, each with its own
-`SetupDir` and `InstalledComponents`).
+`SetupDir`, `InstalledComponents`, and `ExtraDatabases`).
 
 ### 2.2 Inventory (discovered, not listed)
 
@@ -80,7 +81,10 @@ At startup the script reads, for each install:
 Each database name is passed through a **parser** to derive its role, environment,
 and site. The result is a live inventory of "items", each being a Database, a
 NameServer, an MSSQLBroker, or an OracleBroker. A component is inventoried only if
-its type appears in that install's `InstalledComponents` allowlist.
+its type appears in that install's `InstalledComponents` allowlist. A managed
+database whose name the parser does **not** recognize is normally skipped, unless
+it is named in that install's `ExtraDatabases` allowlist — then it is inventoried
+as a Database with `Role="Extra"` and `Site`/`Env="All"`.
 
 ### 2.3 Selectors and actions
 
@@ -139,11 +143,11 @@ List your real servers. Example:
 
 ```powershell
 $Installs=@(
-    [PSCustomObject]@{ App="App1"; Tier="Production";  Server="dbserver1";     OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; InstallDir="/opt/app1";      SetupDir="/opt/app1/setup" }
-    [PSCustomObject]@{ App="App1"; Tier="Development"; Server="dbserver1-dev"; OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; InstallDir="/opt/app1";      SetupDir="/opt/app1/setup" }
-    [PSCustomObject]@{ App="App1"; Tier="Development"; Server="dbserver1-dev"; OEVersion="10.2B"; DLC="/usr/dlc102b"; Port=20941; InstallDir="/opt/app1-102b"; SetupDir="/opt/app1-102b/setup" }
-    [PSCustomObject]@{ App="App2"; Tier="Production";  Server="dbserver2";     OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; InstallDir="/opt/app2";      SetupDir="/opt/app2/setup" }
-    [PSCustomObject]@{ App="App2"; Tier="Development"; Server="dbserver2-dev"; OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; InstallDir="/opt/app2";      SetupDir="/opt/app2/setup" }
+    [PSCustomObject]@{ App="App1"; Tier="Production";  Server="dbserver1";     OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; InstallDir="/opt/app1";      SetupDir="/opt/app1/setup";      InstalledComponents=@("NameServer");                           ExtraDatabases=@() }
+    [PSCustomObject]@{ App="App1"; Tier="Development"; Server="dbserver1-dev"; OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; InstallDir="/opt/app1";      SetupDir="/opt/app1/setup";      InstalledComponents=@("NameServer","MSSQLBroker","OracleBroker"); ExtraDatabases=@("schemaholder1") }
+    [PSCustomObject]@{ App="App1"; Tier="Development"; Server="dbserver1-dev"; OEVersion="10.2B"; DLC="/usr/dlc102b"; Port=20941; InstallDir="/opt/app1-102b"; SetupDir="/opt/app1-102b/setup"; InstalledComponents=@();                                       ExtraDatabases=@() }
+    [PSCustomObject]@{ App="App2"; Tier="Production";  Server="dbserver2";     OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; InstallDir="/opt/app2";      SetupDir="/opt/app2/setup";      InstalledComponents=@("NameServer");                           ExtraDatabases=@() }
+    [PSCustomObject]@{ App="App2"; Tier="Development"; Server="dbserver2-dev"; OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; InstallDir="/opt/app2";      SetupDir="/opt/app2/setup";      InstalledComponents=@();                                       ExtraDatabases=@() }
 )
 ```
 

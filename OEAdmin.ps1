@@ -701,6 +701,15 @@ param (
     #               NOTE: it is PER INSTALL/AdminServer - two OE versions on one box
     #               each with their own AdminServer list their own components.
     #               CHANGE THIS to what each install really runs.
+    #   ExtraDatabases - ALLOWLIST of EXTRA databases this install's AdminServer
+    #               manages that are NOT application databases (so the app name-parser
+    #               returns $null and they would normally be skipped) but that you
+    #               still want inventoried and actionable - e.g. a schema-holder
+    #               database.  EXACT database names (case-insensitive), or @() for
+    #               none.  Each listed DB is added as a Database row with Role="Extra"
+    #               and Site/Env="All" (like the server-wide components), tagged with
+    #               this install's App.  PER INSTALL (the extras differ by box/AdminServer).
+    #               CHANGE THIS (default @()) to any non-app DBs each install manages.
     #
     # A single server can host MULTIPLE installs (e.g. two OpenEdge versions side
     # by side on different DLCs and ports) - just add a row for each.
@@ -709,12 +718,12 @@ param (
     # discovered from each install's property files at run time.
     $Installs=@(
         # ---- App1: prod on dbserver1, dev on dbserver1-dev (two OE versions) ----
-        [PSCustomObject]@{ App="App1"; Tier="Production";  Server="dbserver1";     OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; InstallDir="/opt/app1";      SetupDir="/opt/app1/setup";      InstalledComponents=@("NameServer") }
-        [PSCustomObject]@{ App="App1"; Tier="Development"; Server="dbserver1-dev"; OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; InstallDir="/opt/app1";      SetupDir="/opt/app1/setup";      InstalledComponents=@("NameServer","MSSQLBroker","OracleBroker") }
-        [PSCustomObject]@{ App="App1"; Tier="Development"; Server="dbserver1-dev"; OEVersion="10.2B"; DLC="/usr/dlc102b"; Port=20941; InstallDir="/opt/app1-102b"; SetupDir="/opt/app1-102b/setup"; InstalledComponents=@() }
+        [PSCustomObject]@{ App="App1"; Tier="Production";  Server="dbserver1";     OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; InstallDir="/opt/app1";      SetupDir="/opt/app1/setup";      InstalledComponents=@("NameServer"); ExtraDatabases=@() }
+        [PSCustomObject]@{ App="App1"; Tier="Development"; Server="dbserver1-dev"; OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; InstallDir="/opt/app1";      SetupDir="/opt/app1/setup";      InstalledComponents=@("NameServer","MSSQLBroker","OracleBroker"); ExtraDatabases=@("schemaholder1") }
+        [PSCustomObject]@{ App="App1"; Tier="Development"; Server="dbserver1-dev"; OEVersion="10.2B"; DLC="/usr/dlc102b"; Port=20941; InstallDir="/opt/app1-102b"; SetupDir="/opt/app1-102b/setup"; InstalledComponents=@(); ExtraDatabases=@() }
         # ---- App2: prod on dbserver2, dev on dbserver2-dev ----------------------
-        [PSCustomObject]@{ App="App2"; Tier="Production";  Server="dbserver2";     OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; InstallDir="/opt/app2";      SetupDir="/opt/app2/setup";      InstalledComponents=@("NameServer") }
-        [PSCustomObject]@{ App="App2"; Tier="Development"; Server="dbserver2-dev"; OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; InstallDir="/opt/app2";      SetupDir="/opt/app2/setup";      InstalledComponents=@() }
+        [PSCustomObject]@{ App="App2"; Tier="Production";  Server="dbserver2";     OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; InstallDir="/opt/app2";      SetupDir="/opt/app2/setup";      InstalledComponents=@("NameServer"); ExtraDatabases=@() }
+        [PSCustomObject]@{ App="App2"; Tier="Development"; Server="dbserver2-dev"; OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; InstallDir="/opt/app2";      SetupDir="/opt/app2/setup";      InstalledComponents=@(); ExtraDatabases=@() }
     )
 )
 
@@ -1026,9 +1035,25 @@ function Build-Inventory {
         # ---- Databases (dbman) ----
         # Broker (4GL client-connect) ports, keyed by lowercase db name.
         $brokerPorts = Get-BrokerPorts -PropertiesDir $install.PropertiesDir
+        # Allowlist of EXTRA databases this install's AdminServer manages that are
+        # NOT application databases (so Parse-Database returns $null for them) but we
+        # still want to see and act on - e.g. a schema-holder database.  Exact-name
+        # match (case-insensitive).  Each matched DB is inventoried as a Database row
+        # with Role="Extra", Site/Env="All" (like the server-wide components), tagged
+        # with the install's App.  Absent/empty list => no extras added (default).
+        $extraDbs = @($install.ExtraDatabases)
+
         foreach ($db in (Get-ManagedDatabases -PropertiesDir $install.PropertiesDir)) {
             $parsed = Parse-Database -App $install.App -DBName $db.Name
-            if ($null -eq $parsed) { continue }   # skip anything outside the app's managed set
+            if ($null -eq $parsed) {
+                # Not an application DB.  Keep it ONLY if it's on this install's
+                # ExtraDatabases allowlist; otherwise skip (as before).
+                if ($extraDbs -contains $db.Name) {
+                    $parsed = [PSCustomObject]@{ Role = "Extra"; Site = "All"; Env = "All" }
+                } else {
+                    continue   # outside the app's managed set and not an allowed extra
+                }
+            }
             # NB: use $dbLogFile, NOT $logFile.  PowerShell variable names are
             # case-insensitive, so a local "$logFile" is the SAME variable as the
             # global "$LogFile" (the script's own log path).  A distinct name avoids

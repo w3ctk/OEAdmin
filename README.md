@@ -73,11 +73,13 @@ Everything below is marked `CHANGE THIS` in the script. In rough priority order:
    app, tier (Production/Development), server hostname, OpenEdge version, DLC
    path, AdminServer port, `InstallDir` (the install root — also the PROPATH root
    the `-Workspace` launch rewrites), `SetupDir` (the client INI/PF root, always
-   `<InstallDir>/setup`), and `InstalledComponents` (which shared components —
-   NameServer / MSSQLBroker / OracleBroker — that install runs). `InstallDir` /
-   `SetupDir` / `InstalledComponents` are per row because they vary by machine and
-   OE version. A single server can have several rows (e.g. two OpenEdge versions
-   side by side).
+   `<InstallDir>/setup`), `InstalledComponents` (which shared components —
+   NameServer / MSSQLBroker / OracleBroker — that install runs), and
+   `ExtraDatabases` (exact names of any non-application DBs the AdminServer
+   manages — e.g. a schema holder — that you still want inventoried; default
+   `@()`). `InstallDir` / `SetupDir` / `InstalledComponents` / `ExtraDatabases`
+   are per row because they vary by machine and OE version. A single server can
+   have several rows (e.g. two OpenEdge versions side by side).
 2. **`-App` ValidateSet** — your application names (keep them in sync with
    `$Installs`).
 3. **`$ValidSites` / `-Site`** — your site codes (or drop sites if you have none).

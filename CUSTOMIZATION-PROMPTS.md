@@ -95,7 +95,18 @@ For **each OpenEdge install** (a server + a DLC directory + a version):
   *Why:* sets each row's `InstalledComponents` allowlist, which gates what
   `-Start`/`-Stop`/`-Restart` will touch (and is per install/AdminServer — two OE
   versions on one box each declare their own).
-  *Why (the rows):* Q3.1–Q3.7 become the rows of `$Installs`. One server can have
+- **Q3.8** Does this install's AdminServer manage any **extra databases that are
+  NOT application databases** — e.g. a **schema-holder** database — that you still
+  want listed and actionable? If so, give me their **exact** database names.
+  *Why:* sets each row's `ExtraDatabases` allowlist (default `@()`). The database
+  name-parser (Topic 5) only recognizes application databases and silently skips
+  everything else; a schema-holder or other non-app DB would therefore never
+  appear. Listing it here forces it into the inventory as a Database row with
+  Role="Extra" and Site/Env="All", tagged with this install's App. Use exact
+  names (case-insensitive); it's per install because the extras differ by box.
+  *Where to find it:* the `[database.*]` section headers in `conmgr.properties` —
+  any managed DB whose name does NOT fit your app naming convention from Topic 5.
+  *Why (the rows):* Q3.1–Q3.8 become the rows of `$Installs`. One server can have
   several rows.
   *Where to find it:* AdminServer port is in the install's config /
   `proadsv -query`; DLC is your `$DLC` env var; the components are the
