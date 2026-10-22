@@ -3103,14 +3103,21 @@ function Get-PackageDependencyMap {
     $inv   = @{}
     $units = @{}   # app-rel compile unit -> $true
 
-    $toAppRel = {
+    # Nested helpers (real functions, not scriptblocks).  A scriptblock's
+    # .Invoke() wraps its return in a collection, so $toAppRel.Invoke(x) handed
+    # back a 1-element Collection instead of a string; that collection then got
+    # used as a hashtable key / value and PowerShell tried to coerce the path to
+    # an Int32 index ("Cannot convert 'Bin/admf100.w' to System.Int32").  Plain
+    # functions return the natural scalar and bind args by name - no wrapping.
+    function ToAppRel {
         param($full)
         $p = ("$full" -replace '\\','/')
         if ($p.ToLower().StartsWith($srcN.ToLower() + '/')) { return $p.Substring($srcN.Length + 1) }
         return $p   # out-of-tree (vendor DLC includes) kept verbatim; never matches a changed file
     }
-    $addDep = {
+    function AddDep {
         param($unitRel, $depRel)
+        if ([string]::IsNullOrEmpty($depRel)) { return }
         if (-not $inv.ContainsKey($depRel)) { $inv[$depRel] = @{} }
         $inv[$depRel][$unitRel] = $true
     }
@@ -3125,7 +3132,7 @@ function Get-PackageDependencyMap {
         if ($xrel.ToLower().StartsWith($xdirN.ToLower() + '/')) { $unitRel = $xrel.Substring($xdirN.Length + 1) }
         $unitRel = $unitRel -replace '\.xref$', ''
         $units[$unitRel] = $true
-        $addDep.Invoke($unitRel, $unitRel) | Out-Null   # a unit depends on itself
+        AddDep -unitRel $unitRel -depRel $unitRel   # a unit depends on itself
 
         foreach ($line in (Get-Content -Path $xf.FullName -ErrorAction SilentlyContinue)) {
             if ([string]::IsNullOrWhiteSpace($line)) { continue }
@@ -3135,8 +3142,8 @@ function Get-PackageDependencyMap {
             if ($toks.Count -ge 2) {
                 $ref = $toks[1]
                 if ($ref -match '^[A-Za-z]:[\\/]' -or $ref -match '^[\\/]') {
-                    $depRel = $toAppRel.Invoke($ref)
-                    $addDep.Invoke($unitRel, $depRel) | Out-Null
+                    $depRel = ToAppRel -full $ref
+                    AddDep -unitRel $unitRel -depRel $depRel
                 }
             }
             # Signal (b): INCLUDE rows.  Find the INCLUDE ref-type and the detail.
@@ -3163,8 +3170,8 @@ function Get-PackageDependencyMap {
                         foreach ($cand in @((Join-PathX $unitDir ($inc -replace '/','\')), (Join-PathX $SrcRoot ($inc -replace '/','\')))) {
                             if (Test-Path -Path $cand -PathType Leaf) { $resolved = ($cand -replace '\\','/'); break }
                         }
-                        $depRel = if ($resolved -ne "") { $toAppRel.Invoke($resolved) } else { ($inc -replace '\\','/') }
-                        $addDep.Invoke($unitRel, $depRel) | Out-Null
+                        $depRel = if ($resolved -ne "") { ToAppRel -full $resolved } else { ($inc -replace '\\','/') }
+                        AddDep -unitRel $unitRel -depRel $depRel
                     }
                     # not a filename-looking token -> {&name} arg ref, discard.
                 }
