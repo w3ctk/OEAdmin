@@ -62,6 +62,17 @@ You may obtain a copy of the License at
         QUIT 1; OEAdmin flags it (red, error count + log path) and sets OnError.
         Wired into -Menu (source/filespec/dir/mode/outputs flow).
 
+1.3.0 - -Compile gains -Exclude / -ExcludeFile; batch + compile output grouped in
+        subdirectories.  -Exclude "pat,pat" and -ExcludeFile <file> (bare name =
+        the standing compile-excludes.txt in the script folder; one pattern per
+        line, '#' comments ok) SKIP files whose path (relative to the source root,
+        '\'/'/' interchangeable) matches - ideal for vendor sample code that never
+        compiles standalone.  Skipped files are logged ("SKIP (excluded): ...") and
+        counted (compiled/errors/warnings/skipped).  Batch artifacts moved to
+        <script dir>/batch/<program>/...; the -Compile driver's stdout/err go to
+        <script dir>/batch/OECompiler/.  (compile.log/listing/xref still live under
+        <sourceroot>/x/<stamp>/.)
+
 #>
 
 <#
@@ -155,18 +166,23 @@ ACTIONS:
     -Client      Launch the Progress GUI client (prowin/prowin32) for one
                  environment.  See per-app rules under the -Client parameter.
     -Batch       Same as -Client but runs a program in batch: the command line
-                 ends with "-p <program> -b".  -Pgm <program>.p is REQUIRED.
+                 ends with "-p <program> -b".  -Pgm <program>.p is REQUIRED.  Output
+                 is grouped per program under <script dir>/batch/<program>/.
     -Compile     Headless Application Compiler.  Same launch/selectors/overrides as
                  -Batch, but the "-p" program is the bundled OECompiler.p (full
                  path, no PROPATH needed) and compile options pass in a generated
                  parameter file.  Compiles -FileSpec (default "*.p *.w *.cls *.t")
                  under the source root (recursive), SAVEing .r beside the source.
                  -Dir restricts to a sub-directory; -Incremental compiles only
-                 missing/newer-than-.r files (absent = full rebuild).  Source is the
-                 -Workspace worktree by default, or -Installed for the install tree.
-                 Output under <sourceroot>/x/<stamp>/: compile.log always, plus
-                 -Listing (listing/) and -Xref/-XrefXml (xref/) per-file when set.
-                 Any COMPILER error is flagged loudly and sets the error exit.
+                 missing/newer-than-.r files (absent = full rebuild).  -Exclude
+                 "pat,pat" and -ExcludeFile <file> SKIP files (wildcard on the path
+                 relative to the source root) - e.g. vendor sample code; skipped
+                 files are logged + counted.  Source is the -Workspace worktree by
+                 default, or -Installed for the install tree.  Output under
+                 <sourceroot>/x/<stamp>/: compile.log always, plus -Listing
+                 (listing/) and -Xref/-XrefXml (xref/) per-file when set; the
+                 driver's stdout/err go to <script dir>/batch/OECompiler/.  Any
+                 COMPILER error is flagged loudly and sets the error exit.
 
 Backup / restore safety model:
     A server Tier (Production vs Development) is attached to every install.
@@ -234,6 +250,12 @@ Usage examples (all switches shown; App/Site/Env names are placeholders):
 
     # ...one sub-directory of the INSTALLED code, specific file spec
     ./OEAdmin.ps1 -Compile -App App1 -Site S1 -Env Test -Installed -Dir src -FileSpec "*.p *.t"
+
+    # ...skip vendor sample code (ad-hoc patterns, path relative to source root)
+    ./OEAdmin.ps1 -Compile -App App1 -Site S1 -Env Test -Workspace feature-x -Exclude "vendor\*,*sample*"
+
+    # ...using the standing exclude file in the script folder (compile-excludes.txt)
+    ./OEAdmin.ps1 -Compile -App App1 -Site S1 -Env Test -Workspace feature-x -ExcludeFile compile-excludes.txt
 
     # Status of ALL servers from one box, over the network (files + -host <server>)
     ./OEAdmin.ps1 -Remote
@@ -573,6 +595,19 @@ param (
     # a git working copy.  Absent = the -Workspace worktree (default); with no
     # -Workspace either, it falls back to the installed tree.
     [switch]$Installed,
+
+    # -Exclude: wildcard pattern(s) of files to SKIP during -Compile.  Each is
+    # matched (case-insensitive, ABL MATCHES) against the file's path RELATIVE to
+    # the source root; '\' and '/' are interchangeable.  Comma-separated list, e.g.
+    # -Exclude "vendor\*,*sample*".  Skipped files are logged + counted separately,
+    # so the error total reflects only your own code.  -Compile only.
+    [string[]]$Exclude=@(),
+
+    # -ExcludeFile: path to a text file of exclude patterns, one per line (blank
+    # lines and '#' comments ignored).  A bare filename resolves in the script's
+    # own folder (a standing "compile-excludes.txt"); a path with a separator is
+    # used verbatim.  Combined with -Exclude.  -Compile only.
+    $ExcludeFile="",
 
     # The startup program appended by -Run (and the menu's "run startup?" prompt).
     # CHANGE THIS to your own startup .p if you use one.
@@ -2432,9 +2467,12 @@ function Do-Batch {
     $L = Resolve-ClientLaunch -Item $Item -Tag "Batch"
     if (-not $L) { return }
 
+    # Output files, grouped per program under <script dir>/batch/<ProgramName>/.
     $pgmBase = [System.IO.Path]::GetFileNameWithoutExtension($Pgm)
-    $outFile = Join-Path $PSScriptRoot ($pgmBase + ".out")
-    $errFile = Join-Path $PSScriptRoot ($pgmBase + ".err")
+    $pgmDir  = Join-PathX (Join-PathX $PSScriptRoot "batch") $pgmBase
+    if ($DryRun -ne $true) { $null = New-Item -ItemType Directory -Path $pgmDir -Force -ErrorAction SilentlyContinue }
+    $outFile = Join-PathX $pgmDir ($pgmBase + ".out")
+    $errFile = Join-PathX $pgmDir ($pgmBase + ".err")
 
     $cargs = @("-ininame", $L.Ini, "-pf", $L.Pf)
     $dargs = @("-ininame", (Split-Path $L.Ini -Leaf), "-pf", (Split-Path $L.Pf -Leaf))
@@ -2527,6 +2565,32 @@ function Do-Compile {
     $xrefDir = Join-PathX $runDir "xref"
     $mode    = if ($Incremental -eq $true) { "incremental" } else { "full" }
 
+    # Build the merged EXCLUDE pattern list from -Exclude (comma lists / array) and
+    # -ExcludeFile (one pattern per line; '#' comments + blanks ignored).  A bare
+    # -ExcludeFile name resolves in the script folder (the standing excludes file);
+    # a path with a separator is used verbatim.  Patterns go to the driver as a
+    # single CHR(1)-delimited value (patterns may contain spaces/commas).
+    $exPatterns = New-Object System.Collections.Generic.List[string]
+    foreach ($entry in @($Exclude)) {
+        foreach ($one in ($entry -split ',')) {
+            $one = $one.Trim()
+            if (-not [string]::IsNullOrWhiteSpace($one)) { $exPatterns.Add($one) }
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ExcludeFile)) {
+        $exPath = if ($ExcludeFile -match '[\\/]') { $ExcludeFile } else { Join-PathX $PSScriptRoot $ExcludeFile }
+        if (Test-Path -Path $exPath -PathType Leaf) {
+            foreach ($ln in (Get-Content -Path $exPath)) {
+                $ln = $ln.Trim()
+                if ([string]::IsNullOrWhiteSpace($ln) -or $ln.StartsWith('#')) { continue }
+                $exPatterns.Add($ln)
+            }
+        } else {
+            Write-Message ("  Compile: -ExcludeFile not found: {0}" -f $exPath) -Fore Yellow
+        }
+    }
+    $excludesValue = ($exPatterns -join ([char]1))
+
     # The parameter file the driver reads (SESSION:PARAMETER).
     $paramFile = Join-PathX $PSScriptRoot ("oecompile_{0}.param" -f $stamp)
     # ABL QUIT carries no OS exit code, so the driver reports pass/fail by writing
@@ -2538,6 +2602,9 @@ function Do-Compile {
     Write-Message ("  output dir : {0}" -f $runDir) -Fore DarkGray
     $dirNote = if ([string]::IsNullOrWhiteSpace($Dir)) { "" } else { "   dir: $Dir" }
     Write-Message ("  file specs : {0}{1}" -f $FileSpec, $dirNote) -Fore DarkGray
+    if ($exPatterns.Count -gt 0) {
+        Write-Message ("  excludes   : {0} pattern(s): {1}" -f $exPatterns.Count, ($exPatterns -join ', ')) -Fore DarkGray
+    }
 
     # Compose the param-file content (the driver defaults recurse=yes).
     $pfLines = @(
@@ -2555,9 +2622,13 @@ function Do-Compile {
         "statusfile = $statusFile"
     )
     if (-not [string]::IsNullOrWhiteSpace($Dir)) { $pfLines += "dir = $Dir" }
+    if ($exPatterns.Count -gt 0) { $pfLines += "excludes = $excludesValue" }
 
-    $outFile = Join-PathX $PSScriptRoot ("OECompiler_{0}.out" -f $stamp)
-    $errFile = Join-PathX $PSScriptRoot ("OECompiler_{0}.err" -f $stamp)
+    # Driver stdout/err grouped under <script dir>/batch/OECompiler/.
+    $pgmDir  = Join-PathX (Join-PathX $PSScriptRoot "batch") "OECompiler"
+    if ($DryRun -ne $true) { $null = New-Item -ItemType Directory -Path $pgmDir -Force -ErrorAction SilentlyContinue }
+    $outFile = Join-PathX $pgmDir ("OECompiler_{0}.out" -f $stamp)
+    $errFile = Join-PathX $pgmDir ("OECompiler_{0}.err" -f $stamp)
 
     $cargs = @("-ininame", $L.Ini, "-pf", $L.Pf)
     $dargs = @("-ininame", (Split-Path $L.Ini -Leaf), "-pf", (Split-Path $L.Pf -Leaf))
@@ -3231,6 +3302,7 @@ function Invoke-Menu {
     $script:Compile=$false; $script:FileSpec="*.p *.w *.cls *.t"; $script:Dir=""
     $script:Incremental=$false; $script:Listing=$false; $script:Xref=$false
     $script:XrefXml=$false; $script:Installed=$false
+    $script:Exclude=@(); $script:ExcludeFile=""
     $script:AsyncCopy=$false; $script:Dest=""
     $script:Git=$false; $script:UpdateRepos=$false
     $script:NewWorkspace=$false; $script:BaseBranch=""; $script:NewBranch=""; $script:BootstrapClone=$false
@@ -3464,6 +3536,18 @@ function Invoke-Menu {
             if ($script:Xref) {
                 $script:XrefXml = Read-YesNo -Prompt "  XREF in XML format?" -Default:$false
             }
+
+            # Exclude patterns (optional): offer the standing compile-excludes.txt
+            # if present, plus ad-hoc patterns.
+            $defExcl = Join-PathX $PSScriptRoot "compile-excludes.txt"
+            if (Test-Path -Path $defExcl -PathType Leaf) {
+                if (Read-YesNo -Prompt "Use the standing exclude file (compile-excludes.txt)?" -Default:$true) {
+                    $script:ExcludeFile = "compile-excludes.txt"
+                }
+            }
+            $exIn = Read-Host "  Extra exclude pattern(s), comma-separated (Enter for none)"
+            if (-not [string]::IsNullOrWhiteSpace($exIn)) { $script:Exclude = @($exIn.Trim()) }
+
             & $askIniPfOverride
         }
 
@@ -3636,6 +3720,8 @@ function Invoke-Menu {
         if ($script:Xref -eq $true)        { $parts += "-Xref" }
         if ($script:XrefXml -eq $true)     { $parts += "-XrefXml" }
         if ($script:Installed -eq $true)   { $parts += "-Installed" }
+        if (@($script:Exclude).Count -gt 0) { $parts += "-Exclude `"$(@($script:Exclude) -join ',')`"" }
+        if (-not [string]::IsNullOrWhiteSpace($script:ExcludeFile)) { $parts += "-ExcludeFile `"$($script:ExcludeFile)`"" }
     }
     if (-not [string]::IsNullOrWhiteSpace($script:Ini)) { $parts += "-Ini `"$($script:Ini)`"" }
     if (-not [string]::IsNullOrWhiteSpace($script:Pf))  { $parts += "-Pf `"$($script:Pf)`"" }
@@ -3798,6 +3884,7 @@ Write-Message "Backup actions:       Backup=$Backup Restore=$Restore CopyBackup=
 Write-Message "Client action:        Client=$Client Run=$Run Ini='$Ini' Pf='$Pf'" -Fore Blue
 Write-Message "Batch action:         Batch=$Batch Pgm='$Pgm'" -Fore Blue
 Write-Message "Compile action:       Compile=$Compile FileSpec='$FileSpec' Dir='$Dir' Incremental=$Incremental Listing=$Listing Xref=$Xref XrefXml=$XrefXml Installed=$Installed" -Fore Blue
+Write-Message "Compile excludes:     Exclude='$(@($Exclude) -join ',')' ExcludeFile='$ExcludeFile'" -Fore Blue
 Write-Message "Checks:               CheckAdminServer=$CheckAdminServer CheckPort=$CheckPort CheckLogErrors=$CheckLogErrors RestartOnError=$RestartOnError" -Fore Blue
 Write-Message "SettingsBackup:       SettingsBackup=$SettingsBackup ForceBackup=$ForceBackup" -Fore Blue
 Write-Message "DryRun / Menu:        DryRun=$DryRun Menu=$Menu" -Fore Blue

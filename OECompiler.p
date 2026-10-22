@@ -71,11 +71,13 @@ DEFINE VARIABLE lXref       AS LOGICAL   NO-UNDO INIT NO.
 DEFINE VARIABLE cXrefDir    AS CHARACTER NO-UNDO.
 DEFINE VARIABLE lXrefXml    AS LOGICAL   NO-UNDO INIT NO.
 DEFINE VARIABLE cStatusFile AS CHARACTER NO-UNDO.  /* ERRORS=<n> written here */
+DEFINE VARIABLE cExcludes   AS CHARACTER NO-UNDO.  /* CHR(1)-delimited exclude patterns */
 
 /* ---- run state ----------------------------------------------------------- */
 DEFINE VARIABLE iCompiled   AS INTEGER   NO-UNDO.
 DEFINE VARIABLE iErrors     AS INTEGER   NO-UNDO.
 DEFINE VARIABLE iWarnings   AS INTEGER   NO-UNDO.
+DEFINE VARIABLE iSkipped    AS INTEGER   NO-UNDO.  /* excluded files */
 DEFINE VARIABLE lLogOpen    AS LOGICAL   NO-UNDO.
 
 DEFINE STREAM sLog.
@@ -87,9 +89,11 @@ DEFINE STREAM sDir.
 /* Status file stream (top level - streams cannot be defined in a procedure). */
 DEFINE STREAM sStat.
 
-/* Forward declaration: the function body is at the bottom of the file, but it is
-   called from CompileDir above it, so ABL needs the signature up front. */
+/* Forward declarations: the function bodies are at the bottom of the file, but
+   they are called from CompileDir above them, so ABL needs the signatures up
+   front. */
 FUNCTION MatchesAnySpec RETURNS LOGICAL (INPUT p_Name AS CHARACTER) FORWARD.
+FUNCTION IsExcluded     RETURNS LOGICAL (INPUT p_File AS CHARACTER) FORWARD.
 
 /* ============================================================================
    MAIN
@@ -135,6 +139,7 @@ DO ON ERROR UNDO, LEAVE ON STOP UNDO, LEAVE:
             WHEN "xrefdir"    THEN cXrefDir    = cVal.
             WHEN "xrefxml"    THEN lXrefXml    = (cVal BEGINS "y" OR cVal BEGINS "Y").
             WHEN "statusfile" THEN cStatusFile = cVal.
+            WHEN "excludes"   THEN cExcludes   = cVal.   /* CHR(1)-delimited patterns */
         END CASE.
     END.
     INPUT CLOSE.
@@ -177,6 +182,9 @@ DO ON ERROR UNDO, LEAVE ON STOP UNDO, LEAVE:
              + (IF lListing THEN "  -> " + cListingDir ELSE "")).
     RUN Log ("  xref        : " + STRING(lXref, "yes/no")
              + (IF lXref THEN "  (" + (IF lXrefXml THEN "xml" ELSE "plain") + ") -> " + cXrefDir ELSE "")).
+    IF cExcludes <> "" AND cExcludes <> ? THEN
+        RUN Log ("  excludes    : " + STRING(NUM-ENTRIES(cExcludes, CHR(1))) + " pattern(s): "
+                 + REPLACE(cExcludes, CHR(1), ", ")).
     RUN Log ("----------------------------------------------------------------").
 
     /* ---- walk + compile -------------------------------------------------- */
@@ -185,7 +193,8 @@ DO ON ERROR UNDO, LEAVE ON STOP UNDO, LEAVE:
     RUN Log ("----------------------------------------------------------------").
     RUN Log ("Compilation finished.  compiled=" + STRING(iCompiled)
              + "  errors=" + STRING(iErrors)
-             + "  warnings=" + STRING(iWarnings)).
+             + "  warnings=" + STRING(iWarnings)
+             + "  skipped=" + STRING(iSkipped)).
     IF iErrors > 0 THEN
         RUN Log ("*** " + STRING(iErrors) + " file(s) had COMPILER ERRORS - review above. ***").
 
@@ -197,7 +206,8 @@ DO ON ERROR UNDO, LEAVE ON STOP UNDO, LEAVE:
        process exit code - is the authoritative signal). */
     RUN WriteOut ("OECompiler: compiled=" + STRING(iCompiled)
                   + " errors=" + STRING(iErrors)
-                  + " warnings=" + STRING(iWarnings)).
+                  + " warnings=" + STRING(iWarnings)
+                  + " skipped=" + STRING(iSkipped)).
     RUN WriteStatus (INPUT iErrors).
     QUIT.
 END.
@@ -250,8 +260,14 @@ PROCEDURE CompileDir:
         IF cEntry = "." OR cEntry = ".." THEN NEXT.
 
         IF INDEX(cAttr, "F") > 0 THEN DO:
-            IF MatchesAnySpec(cEntry) THEN
-                RUN CompileFile (INPUT cFullName).
+            IF MatchesAnySpec(cEntry) THEN DO:
+                IF IsExcluded(cFullName) THEN DO:
+                    iSkipped = iSkipped + 1.
+                    RUN Log ("SKIP (excluded): " + cFullName).
+                END.
+                ELSE
+                    RUN CompileFile (INPUT cFullName).
+            END.
         END.
         ELSE IF INDEX(cAttr, "D") > 0 AND lRecurse THEN
             cSubDirs = cSubDirs
@@ -559,6 +575,41 @@ FUNCTION MatchesAnySpec RETURNS LOGICAL (INPUT p_Name AS CHARACTER):
         IF cSpec = "" THEN NEXT.
         cSpec = REPLACE(cSpec, ".", "~~.").
         IF p_Name MATCHES cSpec THEN RETURN YES.
+    END.
+    RETURN NO.
+END FUNCTION.
+
+
+/* TRUE when p_File (a full path) matches any exclude pattern.  Patterns in
+   cExcludes are CHR(1)-delimited; each is matched (case-insensitively, via
+   MATCHES) against the file's path RELATIVE to the source root, forward-slashed.
+   Patterns may be written with '\' or '/'; both are normalized to '/'.  The
+   pattern's '.' is escaped so it is literal (not "any char"). */
+FUNCTION IsExcluded RETURNS LOGICAL (INPUT p_File AS CHARACTER):
+    DEFINE VARIABLE iPat  AS INTEGER   NO-UNDO.
+    DEFINE VARIABLE cPat  AS CHARACTER NO-UNDO.
+    DEFINE VARIABLE cFull AS CHARACTER NO-UNDO.
+    DEFINE VARIABLE cRel  AS CHARACTER NO-UNDO.
+
+    IF cExcludes = "" OR cExcludes = ? THEN RETURN NO.
+
+    /* file path relative to the source root, forward-slashed */
+    FILE-INFO:FILE-NAME = p_File.
+    cFull = FILE-INFO:FULL-PATHNAME.
+    IF cFull = ? THEN cFull = p_File.
+    cFull = REPLACE(cFull, "~\", "/").
+    cRel = cFull.
+    IF cFull BEGINS cSourceRoot THEN
+        cRel = SUBSTRING(cFull, LENGTH(cSourceRoot) + 1).
+    cRel = LEFT-TRIM(cRel, "/").
+
+    DO iPat = 1 TO NUM-ENTRIES(cExcludes, CHR(1)):
+        cPat = TRIM(ENTRY(iPat, cExcludes, CHR(1))).
+        IF cPat = "" THEN NEXT.
+        cPat = REPLACE(cPat, "~\", "/").   /* accept backslash patterns */
+        cPat = REPLACE(cPat, ".", "~~.").  /* literal dots */
+        /* case-insensitive match on the relative path */
+        IF cRel MATCHES cPat THEN RETURN YES.
     END.
     RETURN NO.
 END FUNCTION.

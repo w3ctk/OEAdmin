@@ -198,6 +198,10 @@ shared components (NameServer / MSSQLBroker / OracleBroker) it actually runs.
 # ...incremental (missing/newer-than-.r only), with per-file listing + xref output
 ./OEAdmin.ps1 -Compile -App App1 -Site S1 -Env Test -Workspace my-feature-branch -Incremental -Listing -Xref
 
+# ...skipping vendor sample code (ad-hoc patterns, or a standing compile-excludes.txt)
+./OEAdmin.ps1 -Compile -App App1 -Site S1 -Env Test -Workspace my-feature-branch -Exclude "vendor\*,*sample*"
+./OEAdmin.ps1 -Compile -App App1 -Site S1 -Env Test -Workspace my-feature-branch -ExcludeFile compile-excludes.txt
+
 # Fast-forward every mapped repo's worktrees (fetch + merge --ff-only), standalone
 ./OEAdmin.ps1 -Git -UpdateRepos
 ./OEAdmin.ps1 -Git -UpdateRepos -App App1   # scope to one app's repos

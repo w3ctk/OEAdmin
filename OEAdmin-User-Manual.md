@@ -448,9 +448,9 @@ Same resolution as `-Client` but runs a program non-interactively:
 <exe> -ininame <ini> -pf <pf> -p <program> -b
 ```
 
-`-Pgm <program>.p` is **required**. The session runs blocking; stdout goes to
-`<script dir>/<program>.out` and stderr to `<program>.err`. A non-zero exit sets
-the error flag.
+`-Pgm <program>.p` is **required**. The session runs blocking; output is grouped
+per program: stdout goes to `<script dir>/batch/<program>/<program>.out` and
+stderr to `.../<program>.err`. A non-zero exit sets the error flag.
 
 ### 7.9a `-Compile` (headless Application Compiler)
 
@@ -481,6 +481,8 @@ What you control:
 | `-Listing` | Also write a per-file **LISTING** (off by default). |
 | `-Xref` / `-XrefXml` | Also write a per-file **XREF** (plain, or XML with `-XrefXml`); off by default. |
 | `-Installed` | Compile the installed tree (`InstallDir`). Absent = the `-Workspace` worktree (default; falls back to installed if no `-Workspace`). |
+| `-Exclude "<pat,pat>"` | Skip files whose path (relative to the source root; `\`/`/` interchangeable) matches any wildcard pattern. Comma-separated list. |
+| `-ExcludeFile <file>` | Skip files matching patterns read from a file (one per line; blank lines and `#` comments ignored). A bare name resolves in the script folder (the standing `compile-excludes.txt`); combined with `-Exclude`. |
 
 **Source** is the `-Workspace` worktree by default (same resolution as a
 `-Workspace` client launch, so references resolve against the working copy), or
@@ -489,10 +491,21 @@ the installed code with `-Installed`.
 **Output** goes under `<sourceroot>/x/<yyyy-MM-dd_HHmmss>/`:
 
 - `compile.log` — **always** written; one consolidated log of every file's result
-  plus a `compiled / errors / warnings` summary.
+  (and `SKIP (excluded): ...` lines) plus a
+  `compiled / errors / warnings / skipped` summary.
 - `listing/` — per-file `.listing` files (only with `-Listing`), mirroring each
   source file's relative path.
 - `xref/` — per-file `.xref` files (only with `-Xref`/`-XrefXml`), same mirroring.
+
+The driver's own stdout/stderr go to `<script dir>/batch/OECompiler/`.
+
+**Excluding files.** Use `-Exclude` (comma-separated patterns) and/or
+`-ExcludeFile` (a file of patterns) to skip source that should not be compiled —
+typically vendor sample code that never compiles standalone. Patterns are matched
+case-insensitively against each file's path relative to the source root, so you
+can exclude a whole directory (`vendor\*`), a filename pattern (`*sample*`), or a
+specific file. Skipped files are logged and counted separately, so the error
+total reflects only the code you care about.
 
 If any file has a compiler **error**, `OECompiler.p` exits non-zero and OEAdmin
 flags it loudly (red, with the error count and the path to `compile.log`) and sets
@@ -740,7 +753,7 @@ Actions: `-Menu`, `-Status`, `-Start`, `-Stop`, `-Restart`, `-Backup`,
 
 Compile: `-Compile` (headless Application Compiler via `OECompiler.p`),
 `-FileSpec` (default `*.p *.w *.cls *.t`), `-Dir`, `-Incremental`, `-Listing`,
-`-Xref`, `-XrefXml`, `-Installed`.
+`-Xref`, `-XrefXml`, `-Installed`, `-Exclude`, `-ExcludeFile`.
 
 Client tools & workspaces: `-Tool` (named entry from the `$Tools` map),
 `-Workspace` (launch from a git working copy), `-Run`/`-Editor`/`-AppBuilder`/
