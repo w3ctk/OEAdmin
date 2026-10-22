@@ -60,7 +60,8 @@ is **one OpenEdge install** and carries:
 | `OEVersion` | OpenEdge version string (matches `-OEVersion`). |
 | `DLC`       | The OpenEdge install directory for this install. |
 | `Port`      | The AdminServer management port for this install. |
-| `SetupDir`  | Root of this install's `-Client`/`-Batch` INI/PF tree (INI under `<SetupDir>/ini/<server>/`, PF under `<SetupDir>/userPfs/<server>/`). Per install, not global, because the root can differ by machine **and** OE version. |
+| `InstallDir` | The install **root** (e.g. `/opt/app1`). This is what appears in the master INI's `PROPATH`, so the `-Workspace` launch rewrites `InstallDir` → the chosen worktree's app folder. Per install, not global. |
+| `SetupDir`  | Root of this install's `-Client`/`-Batch` INI/PF tree, always `<InstallDir>/setup` (INI under `<SetupDir>/ini/<server>/`, PF under `<SetupDir>/userPfs/<server>/`). Per install, not global, because the root can differ by machine **and** OE version. |
 | `InstalledComponents` | Allowlist of shared components this install runs: any of `"NameServer"` / `"MSSQLBroker"` / `"OracleBroker"`, or `@()` for none. Gates which components `-Start`/`-Stop`/`-Restart` touch (see §7); databases ignore it. Per install/AdminServer. |
 
 A single server can appear in several rows (for example, two OpenEdge versions
@@ -138,11 +139,11 @@ List your real servers. Example:
 
 ```powershell
 $Installs=@(
-    [PSCustomObject]@{ App="App1"; Tier="Production";  Server="dbserver1";     OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; SetupDir="/opt/app1/setup" }
-    [PSCustomObject]@{ App="App1"; Tier="Development"; Server="dbserver1-dev"; OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; SetupDir="/opt/app1/setup" }
-    [PSCustomObject]@{ App="App1"; Tier="Development"; Server="dbserver1-dev"; OEVersion="10.2B"; DLC="/usr/dlc102b"; Port=20941; SetupDir="/opt/app1/setup-102b" }
-    [PSCustomObject]@{ App="App2"; Tier="Production";  Server="dbserver2";     OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; SetupDir="/opt/app2/setup" }
-    [PSCustomObject]@{ App="App2"; Tier="Development"; Server="dbserver2-dev"; OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; SetupDir="/opt/app2/setup" }
+    [PSCustomObject]@{ App="App1"; Tier="Production";  Server="dbserver1";     OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; InstallDir="/opt/app1";      SetupDir="/opt/app1/setup" }
+    [PSCustomObject]@{ App="App1"; Tier="Development"; Server="dbserver1-dev"; OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; InstallDir="/opt/app1";      SetupDir="/opt/app1/setup" }
+    [PSCustomObject]@{ App="App1"; Tier="Development"; Server="dbserver1-dev"; OEVersion="10.2B"; DLC="/usr/dlc102b"; Port=20941; InstallDir="/opt/app1-102b"; SetupDir="/opt/app1-102b/setup" }
+    [PSCustomObject]@{ App="App2"; Tier="Production";  Server="dbserver2";     OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; InstallDir="/opt/app2";      SetupDir="/opt/app2/setup" }
+    [PSCustomObject]@{ App="App2"; Tier="Development"; Server="dbserver2-dev"; OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; InstallDir="/opt/app2";      SetupDir="/opt/app2/setup" }
 )
 ```
 
@@ -188,8 +189,9 @@ QA/scratch/template databases get skipped automatically. Add a case in
   `C:/Progress/OpenEdge` on Windows).
 - `$App1BackupDir` / `$App2BackupBase` — where backups live (the `-CopyBackup`
   source, local to the production server).
-- **Client INI/PF setup tree** — this is now the per-install `SetupDir` column in
-  `$Installs` (section 2.1), not a global. Set each row's `SetupDir` to its
+- **Client INI/PF setup tree** — this is the per-install `SetupDir` column in
+  `$Installs` (section 2.1), always `<InstallDir>/setup`, not a global. Set each
+  row's `InstallDir` (install root) and `SetupDir` to their
   machine + version's setup root.
 
 ### 4.5b CopyBackup settings (as needed)
@@ -572,7 +574,7 @@ When `-Workspace <token>` is given (to `-Client`/`-Batch`), the script:
 2. Resolves the per-workspace INI: `<App><Env><Site>-<token>.ini` in the same
    `ini/<server>/` folder as the default INI. If that file already exists it is
    used as-is. If it doesn't, the script **copies the default INI** and rewrites
-   the `PROPATH=` line, replacing the install root (the `SetupDir`) with the
+   the `PROPATH=` line, replacing the install root (the `InstallDir`) with the
    worktree's app path, leaving Progress/UNC segments alone. **The PF is never
    touched** — database connections don't change with the worktree.
 3. Launches the client with its working directory set to the worktree's app path.

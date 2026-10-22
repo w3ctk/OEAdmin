@@ -71,11 +71,13 @@ Everything below is marked `CHANGE THIS` in the script. In rough priority order:
 
 1. **`$Installs` table** — the heart of the config. One row per OpenEdge install:
    app, tier (Production/Development), server hostname, OpenEdge version, DLC
-   path, AdminServer port, `SetupDir` (the client INI/PF root for that install),
-   and `InstalledComponents` (which shared components — NameServer / MSSQLBroker /
-   OracleBroker — that install runs). `SetupDir` and `InstalledComponents` are
-   per row because they vary by machine and OE version. A single server can have
-   several rows (e.g. two OpenEdge versions side by side).
+   path, AdminServer port, `InstallDir` (the install root — also the PROPATH root
+   the `-Workspace` launch rewrites), `SetupDir` (the client INI/PF root, always
+   `<InstallDir>/setup`), and `InstalledComponents` (which shared components —
+   NameServer / MSSQLBroker / OracleBroker — that install runs). `InstallDir` /
+   `SetupDir` / `InstalledComponents` are per row because they vary by machine and
+   OE version. A single server can have several rows (e.g. two OpenEdge versions
+   side by side).
 2. **`-App` ValidateSet** — your application names (keep them in sync with
    `$Installs`).
 3. **`$ValidSites` / `-Site`** — your site codes (or drop sites if you have none).
@@ -84,8 +86,9 @@ Everything below is marked `CHANGE THIS` in the script. In rough priority order:
    site from its name, so you don't list every database by hand. Edit the regex
    and the small maps here.
 5. **Path defaults** — `$DlcBase`, `$App1BackupDir` / `$App2BackupBase`. (The
-   client INI/PF setup-tree root is **per install** now — each `$Installs` row's
-   `SetupDir` — not a global, since it can differ by machine and OE version.)
+   client INI/PF roots are **per install** now — each `$Installs` row's
+   `InstallDir` (install root) and `SetupDir` (`<InstallDir>/setup`) — not globals,
+   since they can differ by machine and OE version.)
 5b. **CopyBackup settings** — `$CopyDestDefaults` (per-app dest dev server;
    `-Dest` overrides), `$BackupShareName`, `$SplitThresholdBytes` /
    `$SplitSliceBytes`, `$CopyMaxRetries` / `$CopyRetryDelay`, `$AsyncCopy` /

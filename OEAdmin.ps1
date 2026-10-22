@@ -569,12 +569,12 @@ param (
     ##### ---- CLIENT (-Client) SETUP LOCATIONS -------------------------------
     # The -Client/-Batch setup-tree root (formerly the global $App1SetupDir /
     # $App2SetupDir params) now lives PER INSTALL in the $Installs table below, as
-    # each row's SetupDir.  This lets the root differ by machine AND OpenEdge
+    # each row's SetupDir (= <InstallDir>/setup).  This lets the root differ by machine AND OpenEdge
     # version.  Layout under each root is unchanged:
     #   <SetupDir>/ini/<server>/<stem>.ini      (App1 stem <App><Env><Site>, e.g.
     #                                            app1TestS1; App2 stem = env word)
     #   <SetupDir>/userPfs/<server>/<stem>.pf
-    # CHANGE THIS by editing the SetupDir on each $Installs row.
+    # CHANGE THIS by editing the InstallDir / SetupDir on each $Installs row.
 
     # Optional explicit overrides for -Client / -Batch.  Pass just the FILENAME
     # (e.g. "app1TestS1.ini"); it is assumed to live in the standard setup
@@ -609,15 +609,23 @@ param (
     [switch]$DryRun,
 
     # Act on ANY server from one box (default off = local only).  With -Remote:
-    #   * inventory is read from EVERY install's property files over the network
-    #     share instead of only the local machine's, so one run can see all
-    #     servers.  File failures (missing / no permission / unreachable) are
-    #     ignored silently.
+    #   * inventory is read over the network share instead of only the local
+    #     machine's.  With an explicit -Server, ONLY that server's property files
+    #     are read; with no -Server, ALL mapped servers are read.  File failures
+    #     (missing / no permission / unreachable) are caught and the install is
+    #     skipped silently (Test-PathSafe), so one unreachable box doesn't abort.
     #   * every path used at runtime is rewritten to that server's network form
     #     (see Convert-ToRemotePath - CHANGE THIS to match your share layout).
     #   * dbman/nsman/mssman and the reachability/broker-port probes target
     #     "-host <server>" instead of localhost.
     # Without -Remote the script behaves exactly as before (localhost only).
+    #
+    # REQUIREMENTS / LIMITATIONS (environmental, not fixable in script): -Remote
+    # needs rights ON each remote box - share read access for the property files
+    # AND AdminServer access over its port.  From a locked-down / non-domain /
+    # non-elevated session those can be denied or unreachable; such a server simply
+    # reports NOT REACHABLE and its targets are skipped.  Prefer an explicit
+    # -Server so a run only touches the one box you actually have rights to.
     #
     # NOTE: -Remote as shipped uses the Windows UNC admin-share convention
     # (\\server\drive$\path).  On Linux there is no single universal equivalent,
@@ -674,12 +682,16 @@ param (
     #   OEVersion - the OpenEdge version string (matches -OEVersion)
     #   DLC       - the OpenEdge install directory for THIS install
     #   Port      - the AdminServer management port for THIS install
-    #   SetupDir  - root of this install's -Client/-Batch INI/PF tree (INI under
-    #               <SetupDir>/ini/<server>/, PF under <SetupDir>/userPfs/<server>/).
-    #               It lives PER INSTALL (not as one global) because the root can
-    #               differ by machine AND OpenEdge version - e.g. a 12.8 install and
-    #               a 10.2B install on the same box, or a laptop with its tree on a
-    #               different drive.  CHANGE THIS to your setup-tree roots.
+    #   InstallDir- the install ROOT (e.g. /opt/app1).  This is what appears in the
+    #               master INI's PROPATH, so the -Workspace launch rewrites
+    #               InstallDir -> the chosen worktree's app folder (see
+    #               Resolve-WorkspaceIni).  CHANGE THIS to your install roots.
+    #   SetupDir  - root of this install's -Client/-Batch INI/PF tree, ALWAYS
+    #               <InstallDir>/setup (INI under <SetupDir>/ini/<server>/, PF under
+    #               <SetupDir>/userPfs/<server>/).  Both live PER INSTALL (not as one
+    #               global) because the root can differ by machine AND OpenEdge
+    #               version - e.g. a 12.8 install and a 10.2B install on the same box,
+    #               or a laptop with its tree on a different drive.  CHANGE THIS.
     #   InstalledComponents - ALLOWLIST of shared components this install actually
     #               runs: any of "NameServer" / "MSSQLBroker" / "OracleBroker" (or
     #               @() for none).  A component discovered in ubroker.properties is only
@@ -697,12 +709,12 @@ param (
     # discovered from each install's property files at run time.
     $Installs=@(
         # ---- App1: prod on dbserver1, dev on dbserver1-dev (two OE versions) ----
-        [PSCustomObject]@{ App="App1"; Tier="Production";  Server="dbserver1";     OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; SetupDir="/opt/app1/setup";      InstalledComponents=@("NameServer") }
-        [PSCustomObject]@{ App="App1"; Tier="Development"; Server="dbserver1-dev"; OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; SetupDir="/opt/app1/setup";      InstalledComponents=@("NameServer","MSSQLBroker","OracleBroker") }
-        [PSCustomObject]@{ App="App1"; Tier="Development"; Server="dbserver1-dev"; OEVersion="10.2B"; DLC="/usr/dlc102b"; Port=20941; SetupDir="/opt/app1/setup-102b"; InstalledComponents=@() }
+        [PSCustomObject]@{ App="App1"; Tier="Production";  Server="dbserver1";     OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; InstallDir="/opt/app1";      SetupDir="/opt/app1/setup";      InstalledComponents=@("NameServer") }
+        [PSCustomObject]@{ App="App1"; Tier="Development"; Server="dbserver1-dev"; OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; InstallDir="/opt/app1";      SetupDir="/opt/app1/setup";      InstalledComponents=@("NameServer","MSSQLBroker","OracleBroker") }
+        [PSCustomObject]@{ App="App1"; Tier="Development"; Server="dbserver1-dev"; OEVersion="10.2B"; DLC="/usr/dlc102b"; Port=20941; InstallDir="/opt/app1-102b"; SetupDir="/opt/app1-102b/setup"; InstalledComponents=@() }
         # ---- App2: prod on dbserver2, dev on dbserver2-dev ----------------------
-        [PSCustomObject]@{ App="App2"; Tier="Production";  Server="dbserver2";     OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; SetupDir="/opt/app2/setup";      InstalledComponents=@("NameServer") }
-        [PSCustomObject]@{ App="App2"; Tier="Development"; Server="dbserver2-dev"; OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; SetupDir="/opt/app2/setup";      InstalledComponents=@() }
+        [PSCustomObject]@{ App="App2"; Tier="Production";  Server="dbserver2";     OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; InstallDir="/opt/app2";      SetupDir="/opt/app2/setup";      InstalledComponents=@("NameServer") }
+        [PSCustomObject]@{ App="App2"; Tier="Development"; Server="dbserver2-dev"; OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; InstallDir="/opt/app2";      SetupDir="/opt/app2/setup";      InstalledComponents=@() }
     )
 )
 
@@ -785,6 +797,17 @@ function Convert-ToRemotePath {
     return $LocalPath
 }
 
+# Test-Path that never throws.  A remote path we lack rights to (or an unreachable
+# server) makes Test-Path raise UnauthorizedAccessException / IO errors instead of
+# returning $false; under -Remote we want those treated as "not present" (skip the
+# install silently), not spewed to the console.
+function Test-PathSafe {
+    param($Path, $PathType = "Any")
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    try   { return [bool](Test-Path -LiteralPath $Path -PathType $PathType -ErrorAction Stop) }
+    catch { return $false }
+}
+
 ## ============================================================================
 ## INSTALL TABLE POST-PROCESSING
 ## ============================================================================
@@ -809,7 +832,7 @@ foreach ($i in $Installs) {
 function Get-ManagedDatabases {
     param([parameter(Mandatory=$true)] $PropertiesDir)
     $file = Join-PathX $PropertiesDir "conmgr.properties"
-    if (-not (Test-Path -Path $file -PathType Leaf)) { return @() }
+    if (-not (Test-PathSafe -Path $file -PathType Leaf)) { return @() }
     $dbs = New-Object System.Collections.Generic.List[object]
     $cur = $null
     switch -regex -file $file {
@@ -837,7 +860,7 @@ function Get-BrokerNames {
         [parameter(Mandatory=$true)] $Prefix
     )
     $file = Join-PathX $PropertiesDir "ubroker.properties"
-    if (-not (Test-Path -Path $file -PathType Leaf)) { return @() }
+    if (-not (Test-PathSafe -Path $file -PathType Leaf)) { return @() }
     $escaped = [Regex]::Escape($Prefix)
     Select-String -Path $file -Pattern "^\[$escaped\.([^\.\]]+)\]$" |
         ForEach-Object { $_.Matches[0].Groups[1].Value }
@@ -866,7 +889,7 @@ function Get-BrokerPorts {
     $file = Join-PathX $PropertiesDir "conmgr.properties"
     $ports = @{}   # db -> port      (best pick so far)
     $isS4gl = @{}  # db -> $true if the recorded port came from a dedicated 4gl group
-    if (-not (Test-Path -Path $file -PathType Leaf)) { return $ports }
+    if (-not (Test-PathSafe -Path $file -PathType Leaf)) { return $ports }
     $curDb = $null; $curPort = $null; $curType = $null
     # flush the current [servergroup.*] block into the map if it carries 4GL.
     $flush = {
@@ -967,6 +990,17 @@ function Build-Inventory {
 
     foreach ($install in $Installs) {
 
+        # -Remote reads each install's property files over the network, so scope the
+        # loop to the targeted server(s)/app FIRST - otherwise -Server X would still
+        # reach out to every other server (slow, and it throws Access Denied on boxes
+        # we have no rights to).  "All" (the -Remote default) reads them all.  Locally
+        # this is a no-op cost-wise (files are on this box) but keeps behavior
+        # identical.  Site/Env/Component/OEVersion are applied later (Select-Inventory).
+        if ($Remote -eq $true) {
+            if ($Server -ne "All" -and $install.Server -ne $Server) { continue }
+            if ($App    -ne "All" -and $install.App    -ne $App)    { continue }
+        }
+
         # Locally (default), property files are read from THIS machine's filesystem
         # (every command runs against -host localhost), so only installs hosted on
         # this server can be inventoried; an install for another server legitimately
@@ -976,8 +1010,8 @@ function Build-Inventory {
         # expected for some servers and is skipped silently (no warning).
         $conmgrFile  = Join-PathX $install.PropertiesDir "conmgr.properties"
         $ubrokerFile = Join-PathX $install.PropertiesDir "ubroker.properties"
-        if (-not (Test-Path -Path $conmgrFile -PathType Leaf) -and
-            -not (Test-Path -Path $ubrokerFile -PathType Leaf)) {
+        if (-not (Test-PathSafe -Path $conmgrFile -PathType Leaf) -and
+            -not (Test-PathSafe -Path $ubrokerFile -PathType Leaf)) {
             if ($Remote -ne $true -and $install.Server -eq $env:COMPUTERNAME) {
                 Write-Message ("  WARNING: no property files for {0} {1} at {2} - skipping" -f `
                     $install.Server, $install.OEVersion, $install.PropertiesDir) -Fore Red
@@ -1014,7 +1048,8 @@ function Build-Inventory {
                 DbPath    = $dbPath                # physical db path (for probkup/prorest)
                 Port      = $install.Port          # AdminServer port (management)
                 BrokerPort= $brokerPorts[$db.Name.ToLower()]  # 4GL client-connect port (may be $null / a service name)
-                SetupDir  = $install.SetupDir      # -Client/-Batch INI/PF root for THIS install (per machine + version)
+                InstallDir= $install.InstallDir    # install ROOT (PROPATH root for -Workspace rewrite)
+                SetupDir  = $install.SetupDir      # -Client/-Batch INI/PF root (<InstallDir>/setup) for THIS install
                 Manager   = "dbman"
                 DLC       = $itemDLC
                 LogFile   = $dbLogFile
@@ -1069,9 +1104,10 @@ function Build-Inventory {
         }
         }
 
-        # ---- Oracle DataServer broker (oradvman) ----
+        # ---- Oracle DataServer broker (oraman) ----
         # Same AdminServer-managed broker model as MS SQL (sections [UBroker.OR.*]
-        # in ubroker.properties), just a different admin utility.  Leave OracleBroker
+        # in ubroker.properties), just a different admin utility (oraman, using the
+        # same -host/-port/-name/-query/-start/-stop flags).  Leave OracleBroker
         # out of InstalledComponents on installs that don't run it.
         if ($allowed -contains "OracleBroker") {
         foreach ($or in (Get-BrokerNames -PropertiesDir $install.PropertiesDir -Prefix "UBroker.OR")) {
@@ -1086,7 +1122,7 @@ function Build-Inventory {
                 OEVersion = $install.OEVersion
                 Name      = $or
                 Port      = $install.Port
-                Manager   = "oradvman"
+                Manager   = "oraman"
                 DLC       = $itemDLC
             })
         }
@@ -1263,13 +1299,15 @@ function Test-InstanceRunning {
         }
         "MSSQLBroker" {
             if ($o -match '(?im)Broker Status\s*:\s*ACTIVE')     { return $true }
-            if ($o -match '(?im)Broker Status\s*:\s*(INACTIVE|STOPPED|DISABLED)') { return $false }
+            # Documented not-running wordings: "Not Running" (OE status views) and
+            # the INACTIVE/STOPPED/DISABLED variants.
+            if ($o -match '(?im)Broker Status\s*:\s*(Not\s*Running|INACTIVE|STOPPED|DISABLED)') { return $false }
             if ($o -match '(?i)not running|no such|not found')   { return $false }
         }
         "OracleBroker" {
-            # oradvman mirrors mssman's "Broker Status : ACTIVE" wording.
+            # oraman mirrors mssman's "Broker Status : ACTIVE" wording.
             if ($o -match '(?im)Broker Status\s*:\s*ACTIVE')     { return $true }
-            if ($o -match '(?im)Broker Status\s*:\s*(INACTIVE|STOPPED|DISABLED)') { return $false }
+            if ($o -match '(?im)Broker Status\s*:\s*(Not\s*Running|INACTIVE|STOPPED|DISABLED)') { return $false }
             if ($o -match '(?i)not running|no such|not found')   { return $false }
         }
     }
@@ -1280,7 +1318,7 @@ function Test-InstanceRunning {
 ## PER-INSTANCE ACTIONS
 ## ============================================================================
 
-$Label = { param($i) "{0,-16} {1,-6} {2,-11} {3}" -f $i.Server,$i.OEVersion,$i.Component,$i.Name }
+$Label = { param($i) "{0,-16} {1,-6} {2,-12} {3}" -f $i.Server,$i.OEVersion,$i.Component,$i.Name }
 
 function Do-Query {
     param($Item)
@@ -1743,7 +1781,7 @@ function Get-WorkspaceWorkDir {
 # Produce the per-WORKSPACE INI for a working-copy launch: target name
 # "<default-stem>-<Token>.ini"; if it exists use it, else copy the default INI and
 # rewrite its PROPATH= line, replacing path segments under the install root
-# ($Item.SetupDir) with the worktree AppPath (Progress/UNC segments untouched).
+# ($Item.InstallDir) with the worktree AppPath (Progress/UNC segments untouched).
 function Resolve-WorkspaceIni {
     param($Item, $DefaultIni)
     $wc = @(Get-WorkingCopies -App $Item.App | Where-Object { $_.Token -ieq $Workspace })[0]
@@ -1759,7 +1797,7 @@ function Resolve-WorkspaceIni {
         Write-Message ("  Workspace: default INI not found to derive from: {0}" -f $DefaultIni) -Fore Red
         $script:OnError = $true; return $null
     }
-    $installRoot = $Item.SetupDir.TrimEnd('/','\')
+    $installRoot = $Item.InstallDir.TrimEnd('/','\')
     $worktree    = $wc.AppPath.TrimEnd('/','\')
     if ($DryRun -eq $true) {
         Write-Message ("  [DRYRUN] would create {0} (PROPATH {1} -> {2})" -f (Split-Path $wsIni -Leaf), $installRoot, $worktree) -Fore DarkGray
@@ -2917,16 +2955,16 @@ function Invoke-Menu {
     Write-Section "OEADMIN - INTERACTIVE MENU"
 
     $action = Read-MenuChoice -Title "What do you want to do?" -Options @(
-        [pscustomobject]@{ Label="Status  - report instance status";           Value="Status" }
-        [pscustomobject]@{ Label="Start   - start instances";                  Value="Start" }
-        [pscustomobject]@{ Label="Stop    - stop instances";                   Value="Stop" }
-        [pscustomobject]@{ Label="Restart - stop then start instances";        Value="Restart" }
-        [pscustomobject]@{ Label="Backup  - probkup online (PROD servers)";    Value="Backup" }
-        [pscustomobject]@{ Label="Restore - prorest prod backup (DEV servers)";Value="Restore" }
+        [pscustomobject]@{ Label="Status     - report instance status";               Value="Status" }
+        [pscustomobject]@{ Label="Start      - start instances";                      Value="Start" }
+        [pscustomobject]@{ Label="Stop       - stop instances";                       Value="Stop" }
+        [pscustomobject]@{ Label="Restart    - stop then start instances";            Value="Restart" }
+        [pscustomobject]@{ Label="Backup     - probkup online (PROD servers)";        Value="Backup" }
+        [pscustomobject]@{ Label="Restore    - prorest prod backup (DEV servers)";    Value="Restore" }
         [pscustomobject]@{ Label="CopyBackup - split+push prod backups -> dev (run on PROD)"; Value="CopyBackup" }
-        [pscustomobject]@{ Label="Client  - launch Progress GUI client";       Value="Client" }
-        [pscustomobject]@{ Label="Batch   - run a Progress program in batch";  Value="Batch" }
-        [pscustomobject]@{ Label="Git     - local repo/worktree maintenance";  Value="Git" }
+        [pscustomobject]@{ Label="Client     - launch Progress GUI client";           Value="Client" }
+        [pscustomobject]@{ Label="Batch      - run a Progress program in batch";      Value="Batch" }
+        [pscustomobject]@{ Label="Git        - local repo/worktree maintenance";      Value="Git" }
     )
     if ($null -eq $action) { return $false }
 
@@ -3344,9 +3382,18 @@ if ($LogFileWrite -eq $true -and $LogFileReset -eq $true) {
     }
 }
 
+# Resolve the -Server scope BEFORE building the inventory, so -Remote reads ONLY
+# the targeted server(s) instead of fanning out to every server.  With -Remote and
+# no explicit -Server, target ALL servers; an explicit -Server is always honored.
+if ($Remote -eq $true -and -not $PSBoundParameters.ContainsKey('Server')) {
+    $Server = "All"
+    Write-Message "Remote: no -Server given; targeting ALL servers." -Fore Blue
+}
+
 # Build the live inventory ONCE, up front.  The menu (below) needs it to know
 # which App/Site/Env combinations actually exist on this machine so it can gray
 # out (red) the ones that don't; the normal dispatch reuses the same inventory.
+# Build-Inventory honors -Server (and -App) so -Remote only touches what it needs.
 $Inventory = Build-Inventory
 
 # Availability model for the menu, derived from the Database items (those are what
@@ -3448,13 +3495,8 @@ Write-Message "SettingsBackup:       SettingsBackup=$SettingsBackup ForceBackup=
 Write-Message "DryRun / Menu:        DryRun=$DryRun Menu=$Menu" -Fore Blue
 Write-Message "Remote:               Remote=$Remote" -Fore Blue
 
-# With -Remote and no explicit -Server, target ALL servers.
-if ($Remote -eq $true -and -not $PSBoundParameters.ContainsKey('Server')) {
-    $Server = "All"
-    Write-Message "Remote: no -Server given; targeting ALL servers." -Fore Blue
-}
-
-# Filter the (already-built) inventory to the requested targets.
+# Filter the (already-built) inventory to the requested targets.  (The -Server
+# scope was resolved before Build-Inventory so -Remote only read the right boxes.)
 $Targets   = @(Select-Inventory -Inventory $Inventory)
 
 Write-Section "SELECTED TARGETS ($($Targets.Count))"
@@ -3517,7 +3559,7 @@ if ($CheckPort -eq $true) {
             $ok  = Test-TcpPort -ComputerName $probeHost -Port $portNum
             $msg = if ($ok) { "LISTENING" } else { "NOT LISTENING" }
             $fore= if ($ok) { "Green" } else { "Red" }
-            Write-Message ("Broker port {0,-14} {1,-30} {2}" -f $portLabel, (& $Label $t), $msg) -Fore $fore
+            Write-Message ("Broker port {0,-22} {1,-50} {2}" -f $portLabel, (& $Label $t), $msg) -Fore $fore
             if (-not $ok) { $OnPortError = $true }
         }
     }
@@ -3824,8 +3866,9 @@ exit 0
 ## CUSTOMIZATION CHECKLIST (search for "CHANGE THIS" to find each spot)
 ## ============================================================================
 ##  1. $Installs table .......... your servers, tiers, OpenEdge versions, DLCs,
-##                                ports, each row's SetupDir (the -Client/-Batch
-##                                INI/PF root, per machine + version), and
+##                                ports, each row's InstallDir (the install root /
+##                                PROPATH root) and SetupDir (= <InstallDir>/setup,
+##                                the -Client/-Batch INI/PF root), and
 ##                                InstalledComponents (which shared components -
 ##                                NameServer/MSSQLBroker - that install runs)
 ##  2. -App ValidateSet ......... your application names (keep in sync with $Installs)

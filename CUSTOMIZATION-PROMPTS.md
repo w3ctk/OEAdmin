@@ -84,9 +84,12 @@ For **each OpenEdge install** (a server + a DLC directory + a version):
 - **Q3.4** The **DLC** (OpenEdge install) path on that server.
 - **Q3.5** The **AdminServer port** for that install (default 20931; a second
   OE version on the same box uses a different port).
-- **Q3.6** The **SetupDir** — the root of this install's `-Client`/`-Batch` INI/PF
-  tree (skip if you won't use the client). *Why:* sets each row's `SetupDir`; it's
-  per install because the root can differ by machine and OE version.
+- **Q3.6** The **InstallDir** (install root) and **SetupDir** (always
+  `<InstallDir>/setup`, the root of this install's `-Client`/`-Batch` INI/PF tree)
+  — skip if you won't use the client. *Why:* sets each row's `InstallDir` and
+  `SetupDir`; they're per install because the root can differ by machine and OE
+  version. `InstallDir` is also what the `-Workspace` launch swaps out of the
+  master INI's PROPATH.
 - **Q3.7** Which **shared components** does this install run — NameServer,
   MS SQL DataServer broker, Oracle DataServer broker, any combination, or none?
   *Why:* sets each row's `InstalledComponents` allowlist, which gates what
@@ -196,7 +199,7 @@ worktree maintenance, from this tool.)*
   *Why:* sets `$GitRepoApps`; only mapped repos are discovered.
 - **Q12.3** When launching from a worktree, the client's PROPATH must point at the
   worktree instead of the installed code. Confirm your **INI PROPATH** contains
-  the install root (the `SetupDir`) so the script can rewrite it, and that the
+  the install root (the `InstallDir`) so the script can rewrite it, and that the
   **PF** (DB connections) should stay unchanged.
   *Why:* drives `Resolve-WorkspaceIni` (copy default INI + rewrite `PROPATH=`,
   leave the PF alone).
