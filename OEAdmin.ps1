@@ -4424,18 +4424,18 @@ function Invoke-Menu {
 
     $action = Read-MenuChoice -Title "What do you want to do?" -Options @(
         [pscustomobject]@{ Label="Status     - report instance status";               Value="Status" }
+        [pscustomobject]@{ Label="Client     - launch Progress GUI client";           Value="Client" }
+        [pscustomobject]@{ Label="Batch      - run a Progress program in batch";      Value="Batch" }
+        [pscustomobject]@{ Label="Git        - local repo/worktree maintenance";      Value="Git" }
+        [pscustomobject]@{ Label="Compile    - compile app source (OECompiler.p)";    Value="Compile" }
+        [pscustomobject]@{ Label="Test       - run the ABLUnit suite (12+)";          Value="Test" }
+        [pscustomobject]@{ Label="Package    - build a release bundle (source+rcode+manifest)"; Value="Package" }
         [pscustomobject]@{ Label="Start      - start instances";                      Value="Start" }
         [pscustomobject]@{ Label="Stop       - stop instances";                       Value="Stop" }
         [pscustomobject]@{ Label="Restart    - stop then start instances";            Value="Restart" }
         [pscustomobject]@{ Label="Backup     - probkup online (PROD servers)";        Value="Backup" }
         [pscustomobject]@{ Label="Restore    - prorest prod backup (DEV servers)";    Value="Restore" }
         [pscustomobject]@{ Label="CopyBackup - split+push prod backups -> dev (run on PROD)"; Value="CopyBackup" }
-        [pscustomobject]@{ Label="Client     - launch Progress GUI client";           Value="Client" }
-        [pscustomobject]@{ Label="Batch      - run a Progress program in batch";      Value="Batch" }
-        [pscustomobject]@{ Label="Compile    - compile app source (OECompiler.p)";    Value="Compile" }
-        [pscustomobject]@{ Label="Package    - build a release bundle (source+rcode+manifest)"; Value="Package" }
-        [pscustomobject]@{ Label="Test       - run the ABLUnit suite (12+)";          Value="Test" }
-        [pscustomobject]@{ Label="Git        - local repo/worktree maintenance";      Value="Git" }
     )
     if ($null -eq $action) { return $false }
 
