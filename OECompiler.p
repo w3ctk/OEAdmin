@@ -272,8 +272,21 @@ PROCEDURE CompileFile:
     DEFINE VARIABLE lStale    AS LOGICAL   NO-UNDO.
     DEFINE VARIABLE cListFile AS CHARACTER NO-UNDO.
     DEFINE VARIABLE cXrefFile AS CHARACTER NO-UNDO.
+    DEFINE VARIABLE cSrcDir   AS CHARACTER NO-UNDO.
+    DEFINE VARIABLE iPos      AS INTEGER   NO-UNDO.
     DEFINE VARIABLE iMsg      AS INTEGER   NO-UNDO.
     DEFINE VARIABLE lHadError AS LOGICAL   NO-UNDO.
+
+    /* The .r goes BESIDE the source.  We give COMPILE an explicit SAVE INTO the
+       source file's own directory rather than a bare SAVE: in a batch session a
+       bare "COMPILE <absolute path> SAVE" cannot reliably resolve where to write
+       the .r and sets COMPILER:ERROR with NO messages (which looked like "every
+       file failed").  SAVE INTO <source dir> writes the .r in exactly the same
+       place (beside the source) with an explicit, writable target. */
+    ASSIGN cSrcDir = REPLACE(p_File, "~\", "/").
+    iPos = R-INDEX(cSrcDir, "/").
+    IF iPos > 0 THEN cSrcDir = SUBSTRING(cSrcDir, 1, iPos - 1).
+    ELSE             cSrcDir = ".".
 
     /* Incremental: skip when a current .r already exists. */
     IF cMode = "incremental" THEN DO:
@@ -295,26 +308,26 @@ PROCEDURE CompileFile:
                           OUTPUT cXrefFile).
     END.
 
-    /* The compile itself.  Four shapes depending on which outputs are on; SAVE
-       (no INTO) drops the .r beside the source, matching production layout. */
+    /* The compile itself.  Four shapes depending on which outputs are on.
+       SAVE INTO <source dir> drops the .r beside the source (production layout). */
     IF cListFile <> "" AND cXrefFile <> "" THEN DO:
         IF lXrefXml THEN
-            COMPILE VALUE(p_File) SAVE LISTING VALUE(cListFile)
+            COMPILE VALUE(p_File) SAVE INTO VALUE(cSrcDir) LISTING VALUE(cListFile)
                 XREF-XML VALUE(cXrefFile) NO-ERROR.
         ELSE
-            COMPILE VALUE(p_File) SAVE LISTING VALUE(cListFile)
+            COMPILE VALUE(p_File) SAVE INTO VALUE(cSrcDir) LISTING VALUE(cListFile)
                 XREF VALUE(cXrefFile) NO-ERROR.
     END.
     ELSE IF cListFile <> "" THEN
-        COMPILE VALUE(p_File) SAVE LISTING VALUE(cListFile) NO-ERROR.
+        COMPILE VALUE(p_File) SAVE INTO VALUE(cSrcDir) LISTING VALUE(cListFile) NO-ERROR.
     ELSE IF cXrefFile <> "" THEN DO:
         IF lXrefXml THEN
-            COMPILE VALUE(p_File) SAVE XREF-XML VALUE(cXrefFile) NO-ERROR.
+            COMPILE VALUE(p_File) SAVE INTO VALUE(cSrcDir) XREF-XML VALUE(cXrefFile) NO-ERROR.
         ELSE
-            COMPILE VALUE(p_File) SAVE XREF VALUE(cXrefFile) NO-ERROR.
+            COMPILE VALUE(p_File) SAVE INTO VALUE(cSrcDir) XREF VALUE(cXrefFile) NO-ERROR.
     END.
     ELSE
-        COMPILE VALUE(p_File) SAVE NO-ERROR.
+        COMPILE VALUE(p_File) SAVE INTO VALUE(cSrcDir) NO-ERROR.
 
     iCompiled = iCompiled + 1.
 
