@@ -4807,6 +4807,18 @@ if ($Menu -eq $true) {
     if (-not (Invoke-Menu)) { Write-Section "SCRIPT COMPLETED"; exit 0 }
 }
 
+# Resolve the DEFAULT action.  -Status defaults to $true so a bare run reports
+# status, but it must NOT tag along when the operator chose another primary
+# action: selecting -Compile (or -Package / -Start / ... ) should run ONLY that,
+# not also print a STATUS report.  So unless -Status was named EXPLICITLY, turn
+# it off whenever any other primary action is set.  (The -Menu flow already sets
+# exactly one action, so this is a no-op there; this covers the CLI.)
+if (-not $PSBoundParameters.ContainsKey('Status')) {
+    $otherAction = $Start -or $Stop -or $Restart -or $Backup -or $Restore -or
+                   $CopyBackup -or $Client -or $Batch -or $Compile -or $Package -or $Git
+    if ($otherAction) { $Status = $false }
+}
+
 # GIT ACTION GROUP - local repo/worktree maintenance; does NOT need the OpenEdge
 # inventory, so it runs and exits before the DB dispatch.  Extensible: dispatch a
 # git sub-action switch (today -UpdateRepos / -NewWorkspace).
@@ -4860,7 +4872,7 @@ if ($Git -eq $true) {
 Write-Section "OEADMIN - PARAMETERS"
 Write-Message "App / Server:         $App / $Server" -Fore Blue
 Write-Message "Site / Env:           $Site / $Env"   -Fore Blue
-Write-Message "OEVersion / Component:$OEVersion / $Component" -Fore Blue
+Write-Message "OEVersion / Component:$(if ($OEVersion -eq 'Matrix') { 'Matrix (each instance''s own version)' } else { $OEVersion }) / $Component" -Fore Blue
 Write-Message "Actions:              Status=$Status Start=$Start Stop=$Stop Restart=$Restart" -Fore Blue
 Write-Message "Backup actions:       Backup=$Backup Restore=$Restore CopyBackup=$CopyBackup" -Fore Blue
 Write-Message "Client action:        Client=$Client Run=$Run Ini='$Ini' Pf='$Pf'" -Fore Blue
