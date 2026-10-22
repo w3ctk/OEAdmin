@@ -61,10 +61,11 @@ is **one OpenEdge install** and carries:
 | `DLC`       | The OpenEdge install directory for this install. |
 | `Port`      | The AdminServer management port for this install. |
 | `SetupDir`  | Root of this install's `-Client`/`-Batch` INI/PF tree (INI under `<SetupDir>/ini/<server>/`, PF under `<SetupDir>/userPfs/<server>/`). Per install, not global, because the root can differ by machine **and** OE version. |
+| `InstalledComponents` | Allowlist of shared components this install runs: any of `"NameServer"` / `"MSSQLBroker"` / `"OracleBroker"`, or `@()` for none. Gates which components `-Start`/`-Stop`/`-Restart` touch (see §7); databases ignore it. Per install/AdminServer. |
 
 A single server can appear in several rows (for example, two OpenEdge versions
 installed side by side on different DLC paths and ports, each with its own
-`SetupDir`).
+`SetupDir` and `InstalledComponents`).
 
 ### 2.2 Inventory (discovered, not listed)
 
@@ -72,12 +73,13 @@ At startup the script reads, for each install:
 
 - `<DLC>/properties/conmgr.properties` → the databases the AdminServer manages,
   and each database's **4GL broker (client-connect) port**.
-- `<DLC>/properties/ubroker.properties` → the **NameServer(s)** and the
-  **MS SQL DataServer broker(s)**.
+- `<DLC>/properties/ubroker.properties` → the **NameServer(s)**, the **MS SQL
+  DataServer broker(s)**, and the **Oracle DataServer broker(s)**.
 
 Each database name is passed through a **parser** to derive its role, environment,
 and site. The result is a live inventory of "items", each being a Database, a
-NameServer, or an MSSQLBroker.
+NameServer, an MSSQLBroker, or an OracleBroker. A component is inventoried only if
+its type appears in that install's `InstalledComponents` allowlist.
 
 ### 2.3 Selectors and actions
 
@@ -225,6 +227,39 @@ if your relay needs TLS.
 Ships with the Windows UNC admin-share convention. For Linux cross-server work,
 change it to map a local path to your NFS mount / ssh target / etc.
 
+### 4.10 Launch tools (`$Tools`) (as needed)
+
+The `$Tools` map defines the named programs a `-Client`/`-Batch` session can run
+(`-Tool <name>`). Each row:
+
+```powershell
+$Tools=@(
+    [PSCustomObject]@{ Name="Run";        Pgm="sh/startup.p"; Extra=""; App=""; Startup=$true }
+    [PSCustomObject]@{ Name="Editor";     Pgm="_edit.p";      Extra=""; App=""; Startup=$false }
+    # ... add your own; App="" = any app, Startup=$true = the app's -Run default
+)
+```
+
+Add rows for your own tools — no code change needed. `-Tool` wins over the fixed
+`-Run`/`-Editor`/... aliases, and an app-specific entry wins over a shared one of
+the same name.
+
+### 4.11 Git working copies (`$GitReposRoot`, `$GitRepoApps`) (only if using -Workspace / -Git)
+
+- `$GitReposRoot` — where your bare-clone + per-branch-worktree repos live. The
+  default is **machine-aware** (edit the resolver to taste); override with the
+  `-GitReposRoot` param. Leave the worktree features unused by simply never
+  passing `-Workspace` / `-Git`.
+- `$GitRepoApps` — maps a repo name to an app (`@{App1Repo="App1"; App2Repo="App2"}`).
+  Only mapped repos are discovered.
+- `$GitProjects` — maps a repo name to a clone URL, used only by
+  `-NewWorkspace -BootstrapClone` to create a missing bare repo. Keys match
+  `$GitRepoApps`.
+- The layout assumption (`<GitReposRoot>/<Repo>/.bare` + one worktree per branch)
+  lives in `Get-WorkingCopies` / the `AppPath` probe — adjust them if your git
+  layout differs (see §7.10). `-NewWorkspace` and `-UpdateRepos` detect a missing
+  `.bare` and handle it safely rather than cloning blindly (see §7.10).
+
 ---
 
 ## 5. Running the script
@@ -266,6 +301,15 @@ Pressing Enter takes the first valid default. Before anything runs it prints the
 **equivalent command line** and asks for a `y/n` confirmation — a good way to
 learn the switches.
 
+The action list includes **Git** (§7.10). Its flow first splits into **Daily
+workflow** (pick a working copy, then status / diff / log / stash / commit /
+push), **Maintenance** (UpdateRepos, or NewWorkspace — which prompts app, base
+branch, optional new branch, and warns before bootstrapping if this machine isn't
+on the bare+worktree layout), and **Cheat sheet** (prints the git help). The
+**Client** flow additionally offers a working-copy picker and a "pull before
+launching?" prompt when worktrees are found for the chosen app (§7.11), and a
+launch-tool picker built from the `$Tools` map scoped to that app.
+
 ---
 
 ## 7. Actions in detail
@@ -293,6 +337,17 @@ Stops the selection. Anything already stopped is **skipped**.
 Stop, then start. Waits `-RestartDelay` seconds (default 10) between the two so
 lingering processes finish exiting before the start.
 
+**Whole-server gating for `-Start`/`-Stop`/`-Restart`.** NameServer, MSSQLBroker,
+and OracleBroker are shared, server-wide resources, so these three actions touch
+them **only when the selection covers every database that install manages** (within
+the `-App` filter). If `-Site`/`-Env` (or `-App`) narrow the selection to a subset
+of an install's databases, that install's components are **left running** and only
+the selected databases are started/stopped (a skipped component is logged in gray).
+So `-Stop -Server <box>` with no site/env stops the databases **and** the shared
+components; `-Stop -Server <box> -Env Prod` stops only the Prod databases. This is
+separate from the `InstalledComponents` allowlist, which decides whether a component
+exists to be acted on at all.
+
 ### 7.5 `-Backup` (Production servers only)
 
 Runs `probkup online <db> <device>` for each selected **Production** database in
@@ -317,8 +372,13 @@ the OS releasing file handles ("database in use").
 ### 7.7 `-CopyBackup` (Production servers only)
 
 **Runs on the production server** and **pushes** production backups to the dev
-server's **named share** (`\\<CopyDestServer>\<BackupShareName>\...`, not the
-admin `drive$` share), scoped by `-App`. The source is a plain **local** path.
+server's **named share** (`\\<Dest>\<BackupShareName>\...`, not the admin
+`drive$` share), scoped by `-App`. The source is a plain **local** path.
+
+The destination dev server comes from **`-Dest <server>`**; if omitted it
+defaults per app from `$CopyDestDefaults` (an explicit `-Dest` always wins). In
+the `-Menu`, CopyBackup offers a picker of that app's Development servers with the
+app default pre-selected (for `-App All`, each app uses its own default).
 
 - A `.bk` larger than `$SplitThresholdBytes` (default 1 GB) is binary-**split**
   into `$SplitSliceBytes` slices (progress meter) under a local
@@ -356,6 +416,24 @@ Add `-Run` to append `-p <StartupProgram>`. Override files with `-Ini` / `-Pf`
 as-is). Add secondary PFs with `-AddPfs "a.pf,b.pf"`. The exe is chosen by the
 target's OpenEdge version.
 
+**Launch tools (`$Tools` map + `-Tool`).** Instead of (or alongside) `-Run`, you
+can name any entry in the `$Tools` configuration map with `-Tool <name>`. Each
+entry has a `Name`, the `Pgm` it runs (its `-p`), optional `Extra` args, an
+optional `App` scope (blank = any app), and a `Startup` flag (the app's default
+"run" tool). The template ships Run/Editor/AppBuilder/Desktop/Dict/Admin; add
+your own by editing `$Tools`, no code change. `-Tool` takes precedence over the
+fixed `-Run`/`-Editor`/... switches (which remain as convenience aliases), and an
+app-specific entry wins over a shared one of the same name. The `-Menu` Client
+flow offers a picker built from `$Tools` scoped to the chosen app.
+
+**Launch from a git working copy (`-Workspace`).** By default `-Client` launches
+the **installed** code. Pass `-Workspace <token>` to launch from a git **working
+copy** (worktree) instead — see §7.10 for how working copies are discovered and
+how the per-workspace INI is built (the PROPATH is rewritten to the worktree; the
+PF is left untouched). Add `-UpdateRepos` to fast-forward that working copy
+before launching. The `-Menu` Client flow offers a working-copy picker (and a
+"pull before launching?" prompt) whenever worktrees are found for the app.
+
 ### 7.9 `-Batch`
 
 Same resolution as `-Client` but runs a program non-interactively:
@@ -368,6 +446,139 @@ Same resolution as `-Client` but runs a program non-interactively:
 `<script dir>/<program>.out` and stderr to `<program>.err`. A non-zero exit sets
 the error flag.
 
+### 7.10 `-Git` (local repo/worktree maintenance)
+
+`-Git` is an extensible action group for git work. It has two **maintenance**
+sub-actions that operate across worktrees (`-UpdateRepos`, `-NewWorkspace`) and a
+set of **day-in-the-life** helpers that operate in one working copy
+(`-GitStatus`/`-GitDiff`/`-GitLog`/`-GitStash`/`-GitStashPop`/`-GitStashList`/
+`-GitCommit`/`-GitPush`), plus `-GitHelp` (a printed cheat sheet).
+
+```bash
+./OEAdmin.ps1 -Git -UpdateRepos          # every mapped repo
+./OEAdmin.ps1 -Git -UpdateRepos -App App1   # only that app's mapped repos
+```
+
+**`-UpdateRepos`** fast-forwards every worktree of each mapped repo: for each repo
+under `$GitReposRoot`, it `fetch`es the bare clone, then runs
+`git merge --ff-only origin/<branch>` in each worktree. Fast-forward-only means it
+never creates merge commits or clobbers local work — a worktree with diverged or
+uncommitted changes is simply skipped with a warning. Honors `-DryRun` (prints the
+git commands, runs nothing). Optional `-App` scopes it to that app's repos (via
+`$GitRepoApps`); `-App All` covers every mapped repo.
+
+`-UpdateRepos` is also usable **with** `-Client`/`-Batch` (alongside
+`-Workspace`) to refresh just the chosen working copy before launching.
+
+**`-NewWorkspace`** creates a new git **working copy** (worktree) for one app's
+repo, based on an existing branch and optionally a new branch cut from it. Rather
+than a fresh full clone, it `git worktree add`s a new folder off the repo's
+existing `.bare`; the folder is named after the branch (slashes → hyphens), so it
+is immediately selectable as a `-Workspace`.
+
+```bash
+# New worktree on an existing branch
+./OEAdmin.ps1 -Git -NewWorkspace -App App1 -BaseBranch main
+
+# New feature branch cut off main, as its own worktree, then launch it
+./OEAdmin.ps1 -Git -NewWorkspace -App App1 -BaseBranch main -NewBranch my-fix
+./OEAdmin.ps1 -Client -App App1 -Site S1 -Env Dev -Workspace my-fix
+```
+
+- `-App <name>` — **required** (a specific app/repo, not `All`).
+- `-BaseBranch <b>` — existing branch to base on (menu: picked from a list; CLI:
+  required).
+- `-NewBranch <b>` — optional; a **new** branch of that name is cut off
+  `-BaseBranch` and checked out, else `-BaseBranch` is used as-is. Names are
+  validated (no `\ / : * ? " < > |`).
+- `-BootstrapClone` — opt-in; see the safety note below.
+
+It `-DryRun`-previews, and refuses up front if the target worktree folder already
+exists.
+
+**Expected git layout (CHANGE THIS for your setup).** The working-copy features
+assume a **bare clone + per-branch worktree** layout: each repo lives at
+`<GitReposRoot>/<Repo>/.bare`, with one worktree folder per branch beside it. If
+your repos are plain clones or laid out differently, adjust `Get-WorkingCopies`
+and the `AppPath` probe. `$GitRepoApps` maps a repo name to an app
+(`@{App1Repo="App1"; App2Repo="App2"}`); only mapped repos are considered.
+
+**Safety for mixed setups (important if other developers run this).** Because
+these sub-actions assume the bare+worktree layout, OEAdmin guards against misuse
+on a machine that uses a conventional single clone:
+
+- **No `.bare` detected → it does not silently clone.** `-NewWorkspace` checks for
+  the bare repo (`git rev-parse --is-bare-repository`). If missing, it explains the
+  layout assumption and **stops without making a change**. To create a *fresh,
+  separate* bare clone there, pass **`-BootstrapClone`** (CLI) or answer **yes** at
+  the menu prompt — the clone comes from `$GitProjects`. Otherwise use your normal
+  `git clone` if you're not on the bare+worktree layout.
+- **Branch already checked out → friendly refusal.** Git allows a branch in only
+  one worktree. Before `worktree add`, OEAdmin checks the repo's `worktree list`;
+  if your chosen branch is already checked out elsewhere it refuses with a clear
+  message (instead of git's raw `fatal: '…' is already checked out`) and suggests
+  another branch or launching the existing worktree with `-Workspace`.
+- **`-UpdateRepos`** simply finds no `.bare` on a non-standard machine and skips
+  that repo with a warning — harmless, but it won't do anything useful there.
+
+**Day-in-the-life git helpers.** The remaining `-Git` sub-actions wrap everyday
+git for people who aren't fully comfortable on the command line. They don't
+replace git — they package the common calls with friendly output (and, for the
+write ones, confirmations). Each runs in **one working copy**, resolved in order:
+`-Workspace <token>` → `-RepoPath <dir>` → the current directory if it's inside a
+git work tree.
+
+- **Read-only (safe, run even under `-DryRun`):**
+  - `-GitStatus` — `git status -sb` + how far ahead/behind upstream + the commits
+    waiting on the server (`git log HEAD..origin/<branch>`).
+  - `-GitDiff` — your uncommitted changes; `-DiffVs <ref>` diffs against a ref
+    (e.g. `origin/main` = "what did I change vs production").
+  - `-GitLog` — pretty history (`git log --oneline --graph --decorate`).
+  - `-GitStashList` — `git stash list`.
+- **Stash save/restore:** `-GitStash` (`git stash push`) and `-GitStashPop`
+  (`git stash pop`).
+- **Guarded writes** (show what will happen, confirm unless `-Yes`, honor
+  `-DryRun`, never `--force`):
+  - `-GitCommit -Message "..."` — stage + commit. `-Message` is **required**;
+    `-AddAll` stages everything first, else only already-staged changes. Shows
+    status + the staged diff and confirms.
+  - `-GitPush` — pushes the current branch; the first push auto-adds
+    `-u origin <branch>` to set tracking.
+- **`-GitHelp`** prints a cheat sheet of the common flow (mapped to both the
+  OEAdmin sub-actions and raw git) **plus** the exact commands for what OEAdmin
+  deliberately does **not** automate — `rebase` onto main, resolving conflict
+  markers, `push --force-with-lease`, and plain `git switch`. Those rewrite
+  history or need human judgement, so they're shown, not run.
+
+```bash
+./OEAdmin.ps1 -Git -GitStatus -Workspace my-feature
+./OEAdmin.ps1 -Git -GitDiff   -Workspace my-feature -DiffVs origin/main
+./OEAdmin.ps1 -Git -GitCommit -Workspace my-feature -AddAll -Message "Add validation"
+./OEAdmin.ps1 -Git -GitPush   -Workspace my-feature
+./OEAdmin.ps1 -Git -GitHelp
+```
+
+Run any of these from inside a working copy and you can drop `-Workspace` — it
+falls back to the current directory.
+
+### 7.11 Working copies and the per-workspace INI
+
+When `-Workspace <token>` is given (to `-Client`/`-Batch`), the script:
+
+1. Discovers the app's working copies with `Get-WorkingCopies` (enumerates
+   `git worktree list` for each mapped repo) and matches the one whose **token**
+   equals `<token>`. A token is the branch name made filename-safe (slashes →
+   hyphens); it's what the menu picker shows.
+2. Resolves the per-workspace INI: `<App><Env><Site>-<token>.ini` in the same
+   `ini/<server>/` folder as the default INI. If that file already exists it is
+   used as-is. If it doesn't, the script **copies the default INI** and rewrites
+   the `PROPATH=` line, replacing the install root (the `SetupDir`) with the
+   worktree's app path, leaving Progress/UNC segments alone. **The PF is never
+   touched** — database connections don't change with the worktree.
+3. Launches the client with its working directory set to the worktree's app path.
+
+With `-DryRun`, the default INI is used (no file is copied or rewritten).
+
 ---
 
 ## 8. Selectors in detail
@@ -379,11 +590,11 @@ the error flag.
 | `-Site`       | `All` / your site codes | Limit to one site (databases only). |
 | `-Env`        | `All` / `Prod` / `Dev` / `Test` / `SBox` | Limit to one environment. |
 | `-OEVersion`  | `Matrix` / a version    | `Matrix` uses each instance's own version; a value limits to that version. |
-| `-Component`  | `All` / `Database` / `NameServer` / `MSSQLBroker` | Limit to one component type. |
+| `-Component`  | `All` / `Database` / `NameServer` / `MSSQLBroker` / `OracleBroker` | Limit to one component type. |
 
-NameServer and MSSQLBroker items are server-wide (site/env = `All`). When you
-restrict by site or env, a server-wide component is kept only if the same
-server+version still has a selected database, so it doesn't tag along
+NameServer, MSSQLBroker, and OracleBroker items are server-wide (site/env =
+`All`). When you restrict by site or env, a server-wide component is kept only if
+the same server+version still has a selected database, so it doesn't tag along
 unexpectedly.
 
 ---
@@ -473,11 +684,26 @@ Settings backup: `-SettingsBackup`, `-ForceBackup`.
 
 Actions: `-Menu`, `-Status`, `-Start`, `-Stop`, `-Restart`, `-Backup`,
 `-Restore`, `-CopyBackup`, `-Client`, `-Run`, `-Batch`, `-Pgm`,
-`-StartupProgram`.
+`-StartupProgram`, `-Git`.
 
-CopyBackup: `-CopyDestServer`, `-BackupShareName`, `-SplitThresholdBytes`,
-`-SplitSliceBytes`, `-CopyMaxRetries`, `-CopyRetryDelay`, `-AsyncCopy`,
-`-AsyncQueueDepth`.
+Client tools & workspaces: `-Tool` (named entry from the `$Tools` map),
+`-Workspace` (launch from a git working copy), `-Run`/`-Editor`/`-AppBuilder`/
+`-Desktop`/`-Dict`/`-Admin` (aliases for `$Tools` entries).
+
+Git (maintenance): `-Git` (action group), `-UpdateRepos` (fast-forward worktrees;
+also usable with `-Client`/`-Batch` + `-Workspace`), `-NewWorkspace` (add a
+worktree for a branch) with `-BaseBranch` / `-NewBranch` / `-BootstrapClone`,
+`-GitReposRoot` (bare-clone/worktree root; machine-aware default), `-GitRepoApps`
+(repo→app map), `-GitProjects` (repo→clone-URL map, for `-BootstrapClone`).
+
+Git (day-in-the-life, scoped via `-Workspace` / `-RepoPath` / current dir):
+`-GitStatus`, `-GitDiff` (`-DiffVs <ref>`), `-GitLog`, `-GitStash`,
+`-GitStashPop`, `-GitStashList`, `-GitCommit` (`-Message`, `-AddAll`), `-GitPush`,
+`-GitHelp`; `-Yes` skips the commit/push confirmation.
+
+CopyBackup: `-Dest` (override; per-app default via `$CopyDestDefaults`),
+`-BackupShareName`, `-SplitThresholdBytes`, `-SplitSliceBytes`, `-CopyMaxRetries`,
+`-CopyRetryDelay`, `-AsyncCopy`, `-AsyncQueueDepth`.
 
 Paths: `-DlcBase`, `-App1BackupDir`, `-App2BackupBase`, `-Ini`, `-Pf`, `-AddPfs`.
 (The client setup-tree root is the per-install `SetupDir` in `$Installs`, not a

@@ -54,8 +54,8 @@ databases.
 
 Manages OpenEdge database brokers (via the "dbman" command through the
 AdminServer), the NameServer (nsman), and optionally the MS SQL DataServer
-broker (mssman), across any number of servers, sites, environments, and
-OpenEdge versions.
+broker (mssman) and Oracle DataServer broker (oradvman), across any number of
+servers, sites, environments, and OpenEdge versions.
 
 The set of managed instances is NOT hardcoded.  It is read at run time from each
 OpenEdge install's property files:
@@ -120,8 +120,9 @@ ACTIONS:
     -Backup      probkup online of the selected Prod databases.
                  PRODUCTION servers only (tier guard).
     -CopyBackup  Push production backups to the dev server's NAMED share
-                 (\\<CopyDestServer>\<BackupShareName>\..., not the admin drive$
-                 share).  RUNS ON THE PRODUCTION server (source is a local path).
+                 (\\<Dest>\<BackupShareName>\..., not the admin drive$ share;
+                 -Dest overrides the per-app default dev server).  RUNS ON THE
+                 PRODUCTION server (source is a local path).
                  A .bk over -SplitThresholdBytes is binary-split into
                  -SplitSliceBytes slices (progress meter), each slice copied with
                  retry/backoff and the local slice deleted on success; the dev
@@ -263,7 +264,7 @@ param (
     $OEVersion="Matrix",
 
     # Component type to target.
-    # Valid: Database, NameServer, MSSQLBroker, or "All".
+    # Valid: Database, NameServer, MSSQLBroker, OracleBroker, or "All".
     $Component="All",
 
     ##### ---- CHECKS TO PERFORM ----------------------------------------------
@@ -346,6 +347,93 @@ param (
     # See the COPY-BACKUP param group for the share/split/retry settings.
     [switch]$CopyBackup,
 
+    # -Git: the git action group (local repo/worktree maintenance under
+    # $GitReposRoot).  Pair with a git sub-action; today -UpdateRepos and
+    # -NewWorkspace.  Designed to grow (status / fetch).
+    #   ./OEAdmin.ps1 -Git -UpdateRepos
+    #   ./OEAdmin.ps1 -Git -NewWorkspace -App App1 -BaseBranch main -NewBranch my-fix
+    [switch]$Git,
+
+    # -UpdateRepos (a -Git sub-action): fast-forward every worktree of each mapped
+    # repo under $GitReposRoot - fetch the bare repo, then `merge --ff-only
+    # origin/<branch>` per worktree.  Safe (ff-only won't clobber local work).  Also
+    # usable with -Client/-Batch to refresh the chosen -Workspace before launching.
+    [switch]$UpdateRepos,
+
+    # -NewWorkspace (a -Git sub-action): create a new git WORKING COPY (worktree)
+    # under $GitReposRoot for a chosen repo/app, based on an existing branch and
+    # (optionally) a new branch cut from it.  The worktree folder is named after the
+    # branch (slashes -> hyphens), so it's immediately selectable as a
+    # -Client/-Batch -Workspace.  Honors -DryRun.  ASSUMES the bare+worktree layout:
+    # if no .bare exists it will NOT silently clone - see -BootstrapClone.  Refuses
+    # if the target folder exists or the base branch is already checked out in
+    # another worktree (git allows a branch in one worktree only).
+    #   -App <name>      which app's repo (required; a specific app, not All).
+    #   -BaseBranch <b>  existing branch to base on (menu -> pick from a list).
+    #   -NewBranch <b>   optional new branch cut off -BaseBranch; blank = use
+    #                    -BaseBranch as-is.
+    #   -BootstrapClone  allow creating the .bare when missing (opt-in; see below).
+    [switch]$NewWorkspace,
+    $BaseBranch="",
+    $NewBranch="",
+
+    # -BootstrapClone (a -NewWorkspace modifier): allow -NewWorkspace to create a
+    # fresh bare clone (<GitReposRoot>\<Repo>\.bare) when one doesn't exist yet.
+    # OFF by default so a developer NOT using the bare+worktree layout isn't given a
+    # surprise second copy of the repo: without this switch, -NewWorkspace detects
+    # the missing .bare, explains the layout assumption, and aborts.  In the menu
+    # this is offered as a yes/no prompt instead of the switch.
+    [switch]$BootstrapClone,
+
+    ##### ---- GIT "DAY IN THE LIFE" SUB-ACTIONS -------------------------------
+    # Convenience wrappers around everyday git, for developers who aren't fully
+    # comfortable on the git command line.  All are -Git sub-actions and all run
+    # in ONE working copy (the "current context"): the worktree chosen with
+    # -Workspace, else -RepoPath, else the current directory if it's inside a git
+    # repo (see Resolve-GitWorkDir).  They do NOT replace real git - they just
+    # package the common calls with friendly output and (for the write ones)
+    # confirmations.  READ-ONLY (safe, change nothing):
+    #   -GitStatus     status + ahead/behind + commits waiting on the server.
+    #   -GitDiff       uncommitted changes; -DiffVs <ref> diffs against a ref.
+    #   -GitLog        pretty history (log --oneline --graph --decorate).
+    #   -GitStashList  git stash list.
+    [switch]$GitStatus,
+    [switch]$GitDiff,
+    [switch]$GitLog,
+    [switch]$GitStashList,
+
+    # STASH save/restore (safe, but they move your uncommitted work around):
+    #   -GitStash      shelve uncommitted changes (git stash push).
+    #   -GitStashPop   restore the most recently shelved changes (git stash pop).
+    [switch]$GitStash,
+    [switch]$GitStashPop,
+
+    # WRITE sub-actions (guarded - show what will happen + confirm; honor -DryRun;
+    # never use --force):
+    #   -GitCommit -Message "..."  stage + commit.  -Message REQUIRED.  -AddAll
+    #                  stages everything (git add -A), else only staged changes.
+    #   -GitPush       push current branch; first push auto-adds -u origin/<branch>.
+    [switch]$GitCommit,
+    [switch]$GitPush,
+
+    # -GitHelp: print a "day in the life" git cheat sheet (common flow + the exact
+    # commands for what OEAdmin does NOT automate - rebase, conflicts, push
+    # --force-with-lease, plain git switch).  Prints only; runs nothing.
+    [switch]$GitHelp,
+
+    # Modifiers for the git sub-actions above:
+    #   -Message <text>  commit message for -GitCommit (required for it).
+    #   -AddAll          -GitCommit: stage ALL changes (git add -A) before commit.
+    #   -DiffVs <ref>    -GitDiff: diff against this ref instead of the working tree.
+    #   -RepoPath <dir>  run the git sub-action here (overrides the current-dir
+    #                    fallback; -Workspace still wins if set).
+    #   -Yes             skip the confirmation prompt on -GitCommit / -GitPush.
+    $Message="",
+    [switch]$AddAll,
+    $DiffVs="",
+    $RepoPath="",
+    [switch]$Yes,
+
     # Launch the Progress GUI client (prowin/prowin32) for one environment.
     #   Multi-site app: requires -Site and a single -Env; INI/PF share the
     #        <App><Env><Site> stem (e.g. app1DevS2.ini + app1DevS2.pf).
@@ -372,11 +460,34 @@ param (
     #   -Admin      -> -p _admin.p   (Data Administration)
     # These five and -Run are MUTUALLY EXCLUSIVE (at most one may be set); the
     # winner supplies the single "-p" program on the -Client command line.
+    # (They are convenience aliases for entries in the $Tools map below.)
     [switch]$Editor,
     [switch]$AppBuilder,
     [switch]$Desktop,
     [switch]$Dict,
     [switch]$Admin,
+
+    # -Tool: which program a -Client/-Batch session runs, by NAME from the $Tools
+    # map below (e.g. -Tool DbUtil).  A data-driven alternative to the fixed
+    # switches above - add a tool by editing $Tools, no code change.  -Run and the
+    # -Editor/... switches are shorthands for the matching $Tools entry.
+    $Tool="",
+
+    # TOOL MAP (CHANGE THIS) - the set of programs a -Client/-Batch session can
+    # launch into.  Each entry: Name (the -Tool value / menu label), Pgm (the "-p"
+    # program), Extra (optional extra client args, e.g. -debugalert), App (optional
+    # app scope - blank = any), Startup ([bool] - the app's -Run startup tool).
+    # (The Startup Pgm mirrors $StartupProgram's default; keep them in sync, or
+    # resolve Startup from $StartupProgram in code if you prefer one source.)
+    $Tools=@(
+        [PSCustomObject]@{ Name="Startup";    Pgm="sh/startup.p"; Extra=""; App=""; Startup=$true }
+        [PSCustomObject]@{ Name="DbUtil";     Pgm="StartUtils.p"; Extra=""; App=""; Startup=$false }
+        [PSCustomObject]@{ Name="Editor";     Pgm="_edit.p";       Extra=""; App=""; Startup=$false }
+        [PSCustomObject]@{ Name="AppBuilder"; Pgm="_ab.p";         Extra=""; App=""; Startup=$false }
+        [PSCustomObject]@{ Name="Desktop";    Pgm="_desk.p";       Extra=""; App=""; Startup=$false }
+        [PSCustomObject]@{ Name="Dict";       Pgm="_dict.p";       Extra=""; App=""; Startup=$false }
+        [PSCustomObject]@{ Name="Admin";      Pgm="_admin.p";      Extra=""; App=""; Startup=$false }
+    ),
 
     # -Batch: run the Progress client in BATCH (non-interactive) mode.  Same rules
     # as -Client but the command line ends with "-p <program> -b", and the session
@@ -413,13 +524,19 @@ param (
     # slices, the slices are copied to a NAMED share on the dev server (not the
     # admin drive$ / UNC admin share), then reassembled on the dev side at restore.
 
-    # Dev server that backups are pushed to (the restore target host).
-    $CopyDestServer="dbserver1-dev",
+    # Dev server that backups are pushed to (the restore target host).  OVERRIDE
+    # for a one-off; leave blank to use the per-app default below.  On the -Menu
+    # this is a picker of all Development servers for the chosen app.
+    $Dest="",
+
+    # Per-app DEFAULT destination dev server, used when -Dest is blank.  CHANGE
+    # THIS to your apps' dev servers.  (A value in -Dest always wins.)
+    $CopyDestDefaults=@{ App1="dbserver1-dev"; App2="dbserver2-dev" },
 
     # NAMED share on the dev server mapping to its backup directory.  The copy
-    # destination is \\<CopyDestServer>\<BackupShareName>\... on Windows (a real
-    # share, NOT the admin drive$ share).  On Linux set this to however you reach
-    # the dev server's backup dir and adjust the destination-root build below.
+    # destination is \\<dest>\<BackupShareName>\... on Windows (a real share, NOT
+    # the admin drive$ share).  On Linux set this to however you reach the dev
+    # server's backup dir and adjust the destination-root build below.
     $BackupShareName="backups",
 
     # Only split a .bk whose size EXCEEDS this (bytes).  Files at/under it copy
@@ -518,6 +635,37 @@ param (
     # start.  Default 10; set 0 to disable.
     [int]$RestartDelay=10,
 
+    ##### ---- GIT REPOS / WORKING COPIES  (CHANGE THIS) -----------------------
+    # Root of the local git repo layout, if you use the bare-clone + per-branch-
+    # worktree model: each repo is <GitReposRoot>/<Repo>/.bare with one worktree
+    # folder per branch.  Used by -Client/-Batch -Workspace launches and by
+    # -Git -UpdateRepos.  Default is machine-aware (edit to taste).  Leave the
+    # worktree features unused by simply not passing -Workspace / -Git.
+    $GitReposRoot="",
+
+    # Which git repos map to which app, for workspace discovery.  Only these repos
+    # are offered as -Client/-Batch working copies.  CHANGE THIS to your repo->app
+    # mapping (repo folder name under $GitReposRoot -> an -App value).
+    $GitRepoApps=@{ App1="App1"; App2="App2" },
+
+    # Clone URLs per repo, used by -Git -NewWorkspace -BootstrapClone to create a
+    # bare clone when none exists yet under <GitReposRoot>\<Repo>\.bare.  CHANGE
+    # THIS to your repo clone URLs (keys match $GitRepoApps).  Bootstrapping is
+    # OPT-IN (the -BootstrapClone switch / a menu confirmation) so a developer not
+    # on the bare+worktree layout isn't handed a surprise second copy of the repo.
+    $GitProjects=@{
+        App1 = "https://git.example.com/org/_git/App1"
+        App2 = "https://git.example.com/org/_git/App2"
+    },
+
+    # -Workspace: launch -Client/-Batch from a git WORKING COPY (worktree) instead
+    # of the installed code.  Value is the worktree's branch/folder token (slashes
+    # shown as hyphens; see the menu / Get-WorkingCopies).  When set, prowin's
+    # working directory is the worktree app folder and the INI's PROPATH is
+    # rewritten to point at the worktree (see Resolve-WorkspaceIni).  Blank = use
+    # the installed code.
+    $Workspace="",
+
     ##### ---- INSTALL TABLE  (CHANGE THIS - the heart of the config) ----------
     # The ONE place server topology is defined.  Each row is one OpenEdge install:
     #   App       - which application this install hosts (matches -App / ValidateSet)
@@ -532,6 +680,15 @@ param (
     #               differ by machine AND OpenEdge version - e.g. a 12.8 install and
     #               a 10.2B install on the same box, or a laptop with its tree on a
     #               different drive.  CHANGE THIS to your setup-tree roots.
+    #   InstalledComponents - ALLOWLIST of shared components this install actually
+    #               runs: any of "NameServer" / "MSSQLBroker" / "OracleBroker" (or
+    #               @() for none).  A component discovered in ubroker.properties is only
+    #               inventoried if its type is listed here, and components are only
+    #               started/stopped when the selection covers the WHOLE server (see
+    #               the START/STOP/RESTART dispatch).  Databases ignore this list.
+    #               NOTE: it is PER INSTALL/AdminServer - two OE versions on one box
+    #               each with their own AdminServer list their own components.
+    #               CHANGE THIS to what each install really runs.
     #
     # A single server can host MULTIPLE installs (e.g. two OpenEdge versions side
     # by side on different DLCs and ports) - just add a row for each.
@@ -540,12 +697,12 @@ param (
     # discovered from each install's property files at run time.
     $Installs=@(
         # ---- App1: prod on dbserver1, dev on dbserver1-dev (two OE versions) ----
-        [PSCustomObject]@{ App="App1"; Tier="Production";  Server="dbserver1";     OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; SetupDir="/opt/app1/setup" }
-        [PSCustomObject]@{ App="App1"; Tier="Development"; Server="dbserver1-dev"; OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; SetupDir="/opt/app1/setup" }
-        [PSCustomObject]@{ App="App1"; Tier="Development"; Server="dbserver1-dev"; OEVersion="10.2B"; DLC="/usr/dlc102b"; Port=20941; SetupDir="/opt/app1/setup-102b" }
+        [PSCustomObject]@{ App="App1"; Tier="Production";  Server="dbserver1";     OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; SetupDir="/opt/app1/setup";      InstalledComponents=@("NameServer") }
+        [PSCustomObject]@{ App="App1"; Tier="Development"; Server="dbserver1-dev"; OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; SetupDir="/opt/app1/setup";      InstalledComponents=@("NameServer","MSSQLBroker","OracleBroker") }
+        [PSCustomObject]@{ App="App1"; Tier="Development"; Server="dbserver1-dev"; OEVersion="10.2B"; DLC="/usr/dlc102b"; Port=20941; SetupDir="/opt/app1/setup-102b"; InstalledComponents=@() }
         # ---- App2: prod on dbserver2, dev on dbserver2-dev ----------------------
-        [PSCustomObject]@{ App="App2"; Tier="Production";  Server="dbserver2";     OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; SetupDir="/opt/app2/setup" }
-        [PSCustomObject]@{ App="App2"; Tier="Development"; Server="dbserver2-dev"; OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; SetupDir="/opt/app2/setup" }
+        [PSCustomObject]@{ App="App2"; Tier="Production";  Server="dbserver2";     OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; SetupDir="/opt/app2/setup";      InstalledComponents=@("NameServer") }
+        [PSCustomObject]@{ App="App2"; Tier="Development"; Server="dbserver2-dev"; OEVersion="12.8";  DLC="/usr/dlc";     Port=20931; SetupDir="/opt/app2/setup";      InstalledComponents=@() }
     )
 )
 
@@ -573,6 +730,13 @@ $OnPortError= $false
 # On PowerShell 7+ the automatic $IsWindows exists; on 5.1 it does not, so we
 # fall back to the OS env var.  Used to decide tool extension (.bat) and EventLog.
 $IsWindowsHost = if ($null -ne (Get-Variable -Name IsWindows -ErrorAction SilentlyContinue)) { $IsWindows } else { ($env:OS -eq 'Windows_NT') }
+
+# Resolve the git-repos root default if the caller didn't set it.  CHANGE THIS to
+# your layout (e.g. E:\gitRepos on servers, C:\gitRepos on workstations, or a
+# Linux path).  Only used by -Workspace / -Git.
+if ([string]::IsNullOrWhiteSpace($GitReposRoot)) {
+    $GitReposRoot = if (Test-Path "E:\gitRepos") { "E:\gitRepos" } elseif (Test-Path "/opt/gitRepos") { "/opt/gitRepos" } else { "C:\gitRepos" }
+}
 
 # Recognized environments and sites.  CHANGE THIS to your own site codes.
 # Anything outside these sets is treated as QA/template/unknown and ignored.
@@ -857,7 +1021,13 @@ function Build-Inventory {
             })
         }
 
+        # Allowlist of shared components this install actually runs.  A discovered
+        # component is only inventoried if its type is in InstalledComponents (an
+        # absent/empty list means "no shared components here", so none are added).
+        $allowed = @($install.InstalledComponents)
+
         # ---- NameServer (nsman) ----
+        if ($allowed -contains "NameServer") {
         foreach ($ns in (Get-BrokerNames -PropertiesDir $install.PropertiesDir -Prefix "NameServer")) {
             $items.Add([PSCustomObject]@{
                 Component = "NameServer"
@@ -874,10 +1044,13 @@ function Build-Inventory {
                 DLC       = $itemDLC
             })
         }
+        }
 
         # ---- MS SQL DataServer broker (mssman) ----
-        # If you do NOT use the MS SQL DataServer, these simply won't be found in
-        # ubroker.properties and nothing is added - no change needed.
+        # If you do NOT use the MS SQL DataServer, leave MSSQLBroker out of this
+        # install's InstalledComponents (or it simply won't be found in
+        # ubroker.properties and nothing is added).
+        if ($allowed -contains "MSSQLBroker") {
         foreach ($ms in (Get-BrokerNames -PropertiesDir $install.PropertiesDir -Prefix "UBroker.MS")) {
             $items.Add([PSCustomObject]@{
                 Component = "MSSQLBroker"
@@ -893,6 +1066,30 @@ function Build-Inventory {
                 Manager   = "mssman"
                 DLC       = $itemDLC
             })
+        }
+        }
+
+        # ---- Oracle DataServer broker (oradvman) ----
+        # Same AdminServer-managed broker model as MS SQL (sections [UBroker.OR.*]
+        # in ubroker.properties), just a different admin utility.  Leave OracleBroker
+        # out of InstalledComponents on installs that don't run it.
+        if ($allowed -contains "OracleBroker") {
+        foreach ($or in (Get-BrokerNames -PropertiesDir $install.PropertiesDir -Prefix "UBroker.OR")) {
+            $items.Add([PSCustomObject]@{
+                Component = "OracleBroker"
+                App       = $install.App
+                Tier      = $install.Tier
+                Role      = "OracleBroker"
+                Server    = $install.Server
+                Site      = "All"
+                Env       = "All"
+                OEVersion = $install.OEVersion
+                Name      = $or
+                Port      = $install.Port
+                Manager   = "oradvman"
+                DLC       = $itemDLC
+            })
+        }
         }
     }
     return $items
@@ -1065,6 +1262,12 @@ function Test-InstanceRunning {
             if ($o -match '(?i)not running|could not|no such|not found') { return $false }
         }
         "MSSQLBroker" {
+            if ($o -match '(?im)Broker Status\s*:\s*ACTIVE')     { return $true }
+            if ($o -match '(?im)Broker Status\s*:\s*(INACTIVE|STOPPED|DISABLED)') { return $false }
+            if ($o -match '(?i)not running|no such|not found')   { return $false }
+        }
+        "OracleBroker" {
+            # oradvman mirrors mssman's "Broker Status : ACTIVE" wording.
             if ($o -match '(?im)Broker Status\s*:\s*ACTIVE')     { return $true }
             if ($o -match '(?im)Broker Status\s*:\s*(INACTIVE|STOPPED|DISABLED)') { return $false }
             if ($o -match '(?i)not running|no such|not found')   { return $false }
@@ -1348,6 +1551,13 @@ function Get-ClientIni {
         $file = "{0}{1}{2}.ini" -f $Item.App, $Item.Env, $Item.Site
         $p = Join-PathX $root "ini" $Item.Server $file
     }
+    # -Workspace: launch from a git working copy - use a per-workspace INI variant
+    # with its PROPATH rewritten to the worktree (local runs only; see
+    # Resolve-WorkspaceIni).
+    if (-not [string]::IsNullOrWhiteSpace($Workspace) -and $Remote -ne $true) {
+        $p = Resolve-WorkspaceIni -Item $Item -DefaultIni $p
+        if (-not $p) { return $null }
+    }
     if ($Remote -eq $true) { return (Convert-ToRemotePath -Server $Item.Server -LocalPath $p) }
     return $p
 }
@@ -1454,6 +1664,19 @@ function Resolve-ClientLaunch {
 #   -Dict       -> _dict.p     -Admin      -> _admin.p
 # Returns $null when none is set (plain client launch, no -p).
 function Get-ClientRunProgram {
+    param($App = "")
+    # -Tool <name> (data-driven) takes precedence over the fixed switches.
+    if (-not [string]::IsNullOrWhiteSpace($Tool)) {
+        $cands = @($Tools | Where-Object { $_.Name -ieq $Tool -and ($_.App -eq "" -or $_.App -eq $App) })
+        $pick  = @($cands | Sort-Object { if ($_.App -eq $App) { 0 } else { 1 } })[0]
+        if (-not $pick) {
+            Write-Message ("  Unknown -Tool '{0}'. Valid: {1}" -f $Tool, ((@($Tools | Where-Object { $_.App -eq '' -or $_.App -eq $App }) | Select-Object -ExpandProperty Name -Unique) -join ', ')) -Fore Red
+            $script:OnError = $true; return $null
+        }
+        $prog = $pick.Pgm
+        if (-not [string]::IsNullOrWhiteSpace($pick.Extra)) { $prog = "$prog $($pick.Extra)" }
+        return $prog
+    }
     if ($Run        -eq $true) { return $StartupProgram }
     if ($Editor     -eq $true) { return "_edit.p" }
     if ($AppBuilder -eq $true) { return "_ab.p" }
@@ -1467,6 +1690,552 @@ function Get-ClientRunProgram {
 # options space-separated):  <exe> -ininame <ini> -pf <pf> [ -p <program> ]
 # The optional "-p <program>" comes from Get-ClientRunProgram (the -Run startup
 # program or a -Editor/-AppBuilder/-Desktop/-Dict/-Admin tool).
+# ---- GIT WORKING COPIES + -Workspace launch (CHANGE THIS for your layout) ----
+# These assume the bare-clone + per-branch-worktree layout: each repo at
+# <GitReposRoot>/<Repo>/.bare with one worktree folder per branch.  If you use a
+# different git layout, adjust Get-WorkingCopies / the AppPath probe.
+
+# Discover the git working copies (worktrees) on disk for an app, via each mapped
+# repo's bare clone.  Returns { App; Repo; Branch; Token; WorktreePath; AppPath }.
+# Token is a filename-safe branch id; AppPath is the launchable content folder
+# inside the worktree (probed: <wt>/<repo>, else <wt>).
+function Get-WorkingCopies {
+    param($App = "All")
+    $results = New-Object System.Collections.Generic.List[object]
+    foreach ($repo in $GitRepoApps.Keys) {
+        $repoApp = $GitRepoApps[$repo]
+        if ($App -ne "All" -and $repoApp -ne $App) { continue }
+        $bare = Join-PathX $GitReposRoot $repo ".bare"
+        if (-not (Test-Path -Path $bare)) { continue }
+        $lines = @()
+        try { $lines = & git --git-dir="$bare" worktree list --porcelain 2>$null } catch { $lines = @() }
+        $wt = $null; $br = $null
+        $flush = {
+            if ($wt -and ($wt -notmatch '[\\/]\.bare$')) {
+                $appPath = $wt
+                $cand = Join-PathX $wt $repo
+                if (Test-Path -Path $cand) { $appPath = $cand }
+                $branch = if ($br) { $br } else { Split-Path $wt -Leaf }
+                $token  = ($branch -replace '[\\/]+','-')
+                $results.Add([PSCustomObject]@{ App=$repoApp; Repo=$repo; Branch=$branch; Token=$token; WorktreePath=$wt; AppPath=$appPath })
+            }
+            $wt = $null; $br = $null
+        }
+        foreach ($ln in $lines) {
+            if ($ln -match '^worktree\s+(.+)$')   { & $flush; $wt = $Matches[1] }
+            elseif ($ln -match '^branch\s+(.+)$')  { $br = ($Matches[1] -replace '^refs/heads/','') }
+        }
+        & $flush
+    }
+    return $results
+}
+
+# The prowin working directory for a -Workspace launch (the chosen working copy's
+# AppPath), or $null when no/invalid -Workspace.
+function Get-WorkspaceWorkDir {
+    param($App)
+    if ([string]::IsNullOrWhiteSpace($Workspace)) { return $null }
+    $wc = @(Get-WorkingCopies -App $App | Where-Object { $_.Token -ieq $Workspace })[0]
+    if ($wc) { return $wc.AppPath }
+    return $null
+}
+
+# Produce the per-WORKSPACE INI for a working-copy launch: target name
+# "<default-stem>-<Token>.ini"; if it exists use it, else copy the default INI and
+# rewrite its PROPATH= line, replacing path segments under the install root
+# ($Item.SetupDir) with the worktree AppPath (Progress/UNC segments untouched).
+function Resolve-WorkspaceIni {
+    param($Item, $DefaultIni)
+    $wc = @(Get-WorkingCopies -App $Item.App | Where-Object { $_.Token -ieq $Workspace })[0]
+    if (-not $wc) {
+        Write-Message ("  Workspace '{0}' not found for app {1} under {2}." -f $Workspace, $Item.App, $GitReposRoot) -Fore Red
+        $script:OnError = $true; return $null
+    }
+    $dir  = [System.IO.Path]::GetDirectoryName($DefaultIni)
+    $stem = [System.IO.Path]::GetFileNameWithoutExtension($DefaultIni)
+    $wsIni = Join-PathX $dir ("{0}-{1}.ini" -f $stem, $wc.Token)
+    if (Test-Path -Path $wsIni -PathType Leaf) { return $wsIni }
+    if (-not (Test-Path -Path $DefaultIni -PathType Leaf)) {
+        Write-Message ("  Workspace: default INI not found to derive from: {0}" -f $DefaultIni) -Fore Red
+        $script:OnError = $true; return $null
+    }
+    $installRoot = $Item.SetupDir.TrimEnd('/','\')
+    $worktree    = $wc.AppPath.TrimEnd('/','\')
+    if ($DryRun -eq $true) {
+        Write-Message ("  [DRYRUN] would create {0} (PROPATH {1} -> {2})" -f (Split-Path $wsIni -Leaf), $installRoot, $worktree) -Fore DarkGray
+        return $DefaultIni
+    }
+    $lines = Get-Content -Path $DefaultIni
+    $out = foreach ($ln in $lines) {
+        if ($ln -match '^(?i)PROPATH\s*=') {
+            $eq = $ln.IndexOf('='); $key = $ln.Substring(0,$eq+1); $val = $ln.Substring($eq+1)
+            $newSegs = foreach ($s in ($val -split ',')) {
+                $st = $s.Trim()
+                if ($st -ieq $installRoot) { $worktree }
+                elseif ($st -ilike ($installRoot + '\*') -or $st -ilike ($installRoot + '/*')) { $worktree + $st.Substring($installRoot.Length) }
+                else { $s }
+            }
+            $key + ($newSegs -join ',')
+        } else { $ln }
+    }
+    Set-Content -Path $wsIni -Value $out -Encoding ascii
+    return $wsIni
+}
+
+# Run a git command (local to the box's repos); -DryRun just prints it.  Returns
+# $true on success.  A fetch touches the remote - works from the user's session.
+function Invoke-Git {
+    param([string[]]$Arguments, $Label)
+    $display = "git " + ($Arguments -join ' ')
+    if ($DryRun -eq $true) { Write-Message ("  [DRYRUN] {0}" -f $display) -Fore DarkGray; return $true }
+    try {
+        $out = & git @Arguments 2>&1 | Out-String; $code = $LASTEXITCODE
+    } catch {
+        Write-Message ("  {0}: git error: {1}" -f $Label, $_.Exception.Message) -Fore Red; $script:OnError = $true; return $false
+    }
+    if ($code -ne 0) {
+        Write-Message ("  {0}: git exit {1}`n{2}" -f $Label, $code, $out.Trim()) -Fore Red; $script:OnError = $true; return $false
+    }
+    if ($out.Trim()) { Write-Message ("    {0}" -f ($out.Trim() -replace "`r?`n", "`n    ")) -Fore DarkGray }
+    return $true
+}
+
+# Fast-forward every worktree of the mapped repos under $GitReposRoot: fetch the
+# bare repo, then `merge --ff-only origin/<branch>` per worktree (ff-only won't
+# clobber local work).  -App scopes to one app's repos; -OnlyRepo/-OnlyToken to
+# one repo/worktree (used by the -Client/-Batch refresh-before-launch).
+function Invoke-UpdateRepos {
+    param($App = "All", $OnlyRepo = "", $OnlyToken = "")
+    Write-Section "GIT - UPDATE REPOS (fetch + ff-only per worktree)"
+    $anyRepo = $false
+    foreach ($repo in $GitRepoApps.Keys) {
+        if ($App -ne "All" -and $GitRepoApps[$repo] -ne $App) { continue }
+        if (-not [string]::IsNullOrWhiteSpace($OnlyRepo) -and $repo -ne $OnlyRepo) { continue }
+        $bare = Join-PathX $GitReposRoot $repo ".bare"
+        if (-not (Test-Path -Path $bare)) { Write-Message ("  {0}: no bare repo at {1} - skipping" -f $repo, $bare) -Fore Yellow; continue }
+        $anyRepo = $true
+        Write-Message ("Repo: {0}" -f $repo) -Fore Cyan
+        [void](Invoke-Git -Arguments @("--git-dir=$bare","fetch","origin") -Label "$repo fetch")
+        $wcs = @(Get-WorkingCopies -App $GitRepoApps[$repo] | Where-Object { $_.Repo -eq $repo })
+        if (-not [string]::IsNullOrWhiteSpace($OnlyToken)) { $wcs = @($wcs | Where-Object { $_.Token -ieq $OnlyToken }) }
+        foreach ($wc in $wcs) {
+            Write-Message ("  {0} ({1})" -f $wc.Token, $wc.Branch) -Fore Gray
+            [void](Invoke-Git -Arguments @("-C",$wc.WorktreePath,"merge","--ff-only","origin/$($wc.Branch)") -Label "$($wc.Token) ff-only")
+        }
+    }
+    if (-not $anyRepo) { Write-Message ("  No git repos found under {0}." -f $GitReposRoot) -Fore Yellow }
+}
+
+# Reject names with characters illegal in a Windows folder (and so in a worktree
+# folder / branch token).  Returns $true when the name is usable.
+function Test-GitWorkspaceName {
+    param([string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+    return ($Name -notmatch '[\\/:*?"<>|]')
+}
+
+# Is <GitReposRoot>\<Repo>\.bare an actual bare repo?  The worktree feature set
+# (-NewWorkspace, -UpdateRepos, -Workspace discovery) assumes the "bare clone +
+# per-branch worktree" layout.  Returns $true only when .bare exists AND git
+# agrees it is a repository - so a developer on a conventional single clone (no
+# .bare) is correctly detected as "not this layout".
+function Test-BareLayout {
+    param([string]$Bare)
+    if (-not (Test-Path -Path $Bare)) { return $false }
+    try {
+        $out = & git --git-dir="$Bare" rev-parse --is-bare-repository 2>$null
+        return (($out | Select-Object -First 1) -match '^(?i)true$')
+    } catch { return $false }
+}
+
+# List the branches known to a bare repo (remote-tracking refs, origin/ stripped,
+# HEAD pointer dropped, sorted unique) - what a fresh worktree would base on.
+function Get-GitBranchList {
+    param([string]$Bare)
+    $raw = @()
+    try { $raw = & git --git-dir="$Bare" branch -r 2>$null } catch { $raw = @() }
+    $names = foreach ($ln in $raw) {
+        $t = $ln.Trim()
+        if ($t -match 'HEAD\s*->') { continue }
+        ($t -replace '^origin/','')
+    }
+    return @($names | Where-Object { $_ } | Sort-Object -Unique)
+}
+
+# Branches ALREADY checked out in some worktree of this bare repo.  Git allows a
+# branch in only ONE worktree, so `worktree add` on an already-checked-out branch
+# fails; we pre-flight against this to give a friendly message instead of git's
+# raw "fatal: '<b>' is already checked out".
+function Get-WorktreeCheckedOutBranches {
+    param([string]$Bare)
+    $lines = @()
+    try { $lines = & git --git-dir="$Bare" worktree list --porcelain 2>$null } catch { $lines = @() }
+    $branches = foreach ($ln in $lines) {
+        if ($ln -match '^branch\s+refs/heads/(.+)$') { $Matches[1] }
+    }
+    return @($branches | Where-Object { $_ })
+}
+
+# -Git -NewWorkspace: create a new git WORKING COPY (worktree) for one app's repo,
+# based on an existing branch and optionally a new branch cut from it.  Rather than
+# a fresh full clone into a folder, we `git worktree add` a new folder off the
+# repo's existing .bare, so the result plugs straight into the -Client/-Batch
+# -Workspace picker.  All git goes through Invoke-Git (so -DryRun is honored).
+# Non-destructive: refuses if the target folder exists or the base branch is
+# already checked out elsewhere; `worktree add` never disturbs other worktrees.
+#
+# LAYOUT SAFETY: assumes the bare+worktree layout.  If no .bare is found for the
+# repo (a developer on a plain single clone), it does NOT silently create a second
+# copy.  It explains the situation and only bootstrap-clones a bare repo when
+# explicitly allowed (-BootstrapClone on the CLI, or confirmed in the menu);
+# otherwise it aborts with guidance.
+#   -App             which app's repo (required; resolved to the mapped repo).
+#   -BaseBranch      existing branch to base on (caller validates it exists).
+#   -NewBranch       optional new branch cut off BaseBranch; blank = use BaseBranch.
+#   -BootstrapClone  allow creating the .bare if it's missing (opt-in).
+function Invoke-NewWorkspace {
+    param($App = "", $BaseBranch = "", $NewBranch = "", [bool]$BootstrapClone = $false)
+    Write-Section "GIT - NEW WORKSPACE (git worktree add)"
+
+    if ([string]::IsNullOrWhiteSpace($App) -or $App -eq "All") {
+        Write-Message "  -NewWorkspace needs a specific -App (e.g. -App App1), not All." -Fore Red
+        $script:OnError = $true; return
+    }
+    $repo = @($GitRepoApps.Keys | Where-Object { $GitRepoApps[$_] -eq $App })[0]
+    if (-not $repo) {
+        Write-Message ("  No git repo mapped to app {0} (see `$GitRepoApps)." -f $App) -Fore Red
+        $script:OnError = $true; return
+    }
+    $bare = Join-PathX $GitReposRoot $repo ".bare"
+
+    # LAYOUT CHECK: is this the expected bare+worktree layout?  If not, explain and
+    # only continue (bootstrap a bare clone) when the caller allowed it.
+    if (-not (Test-BareLayout -Bare $bare)) {
+        Write-Message ("  No bare repo found at {0}." -f $bare) -Fore Yellow
+        Write-Message  "  -NewWorkspace expects the bare-clone + per-branch-worktree layout" -Fore Yellow
+        Write-Message ("  under {0} (each repo at <root>\<Repo>\.bare, one worktree folder" -f $GitReposRoot) -Fore Yellow
+        Write-Message  "  per branch).  It looks like this machine does not use that layout." -Fore Yellow
+        if (-not $BootstrapClone) {
+            Write-Message  "  Not continuing (no change made).  Re-run with -BootstrapClone to create" -Fore Yellow
+            Write-Message  "  a fresh bare repo here (a SEPARATE copy from any existing clone), or use" -Fore Yellow
+            Write-Message  "  your own plain `git clone` if you're not on the bare+worktree layout." -Fore Yellow
+            $script:OnError = $true; return
+        }
+        $url = $null
+        if ($GitProjects -and $GitProjects.ContainsKey($repo)) { $url = $GitProjects[$repo] }
+        if ([string]::IsNullOrWhiteSpace($url)) {
+            Write-Message ("  -BootstrapClone requested but no clone URL in `$GitProjects for {0}." -f $repo) -Fore Red
+            $script:OnError = $true; return
+        }
+        Write-Message ("  Bootstrapping a bare clone from {0}" -f $url) -Fore Cyan
+        if (-not (Invoke-Git -Arguments @("clone","--bare",$url,$bare) -Label "$repo bare clone")) { return }
+        [void](Invoke-Git -Arguments @("--git-dir=$bare","config","remote.origin.fetch","+refs/heads/*:refs/remotes/origin/*") -Label "$repo refspec")
+    }
+
+    Write-Message ("Repo: {0}  ({1})" -f $repo, $bare) -Fore Cyan
+    [void](Invoke-Git -Arguments @("--git-dir=$bare","fetch","origin") -Label "$repo fetch")
+
+    if ([string]::IsNullOrWhiteSpace($BaseBranch)) {
+        Write-Message "  No -BaseBranch given (required for -NewWorkspace outside the menu)." -Fore Red
+        $script:OnError = $true; return
+    }
+    if ($DryRun -ne $true) {
+        $known = Get-GitBranchList -Bare $bare
+        if ($known.Count -gt 0 -and ($known -notcontains $BaseBranch)) {
+            Write-Message ("  Base branch '{0}' not found in {1}. Known: {2}" -f $BaseBranch, $repo, ($known -join ', ')) -Fore Red
+            $script:OnError = $true; return
+        }
+    }
+
+    $makeNew  = -not [string]::IsNullOrWhiteSpace($NewBranch)
+    $checkout = if ($makeNew) { $NewBranch } else { $BaseBranch }
+    if (-not (Test-GitWorkspaceName $checkout)) {
+        Write-Message ("  Invalid branch/folder name '{0}' (no \ / : * ? `" < > |)." -f $checkout) -Fore Red
+        $script:OnError = $true; return
+    }
+    $token  = ($checkout -replace '[\\/]+','-')
+    $wtPath = Join-PathX $GitReposRoot $repo $token
+
+    if (Test-Path -Path $wtPath) {
+        Write-Message ("  Worktree folder already exists: {0}" -f $wtPath) -Fore Red
+        $script:OnError = $true; return
+    }
+
+    # PRE-FLIGHT the "branch already checked out" case (git: one worktree per
+    # branch).  Friendly message instead of git's raw fatal.  Skipped under -DryRun.
+    if ($DryRun -ne $true) {
+        $already = Get-WorktreeCheckedOutBranches -Bare $bare
+        if ($already -contains $checkout) {
+            Write-Message ("  Branch '{0}' is already checked out in another worktree of {1}." -f $checkout, $repo) -Fore Red
+            Write-Message  "  Git allows a branch in only one worktree at a time.  Pick a different" -Fore Yellow
+            Write-Message  "  base/new branch, or launch the existing worktree with -Workspace." -Fore Yellow
+            $script:OnError = $true; return
+        }
+    }
+
+    if ($makeNew) {
+        Write-Message ("New branch '{0}' off '{1}' -> {2}" -f $NewBranch, $BaseBranch, $wtPath) -Fore Gray
+        if (-not (Invoke-Git -Arguments @("--git-dir=$bare","worktree","add","-b",$NewBranch,$wtPath,"origin/$BaseBranch") -Label "$token worktree add")) { return }
+    } else {
+        Write-Message ("Branch '{0}' -> {1}" -f $BaseBranch, $wtPath) -Fore Gray
+        if (-not (Invoke-Git -Arguments @("--git-dir=$bare","worktree","add",$wtPath,$BaseBranch) -Label "$token worktree add")) { return }
+    }
+
+    Write-Message "" -Fore Gray
+    Write-Message "New workspace created:" -Fore Green
+    Write-Message ("  App / Repo   : {0} / {1}" -f $App, $repo) -Fore Gray
+    Write-Message ("  Base branch  : {0}" -f $BaseBranch) -Fore Gray
+    if ($makeNew) { Write-Message ("  New branch   : {0}" -f $NewBranch) -Fore Gray }
+    Write-Message ("  Worktree     : {0}" -f $wtPath) -Fore Gray
+    Write-Message ("  Workspace id : {0}   (use: -Client -App {1} -Workspace {0})" -f $token, $App) -Fore Gray
+}
+
+## ============================================================================
+## GIT "DAY IN THE LIFE" HELPERS  (everyday git, scoped to one working copy)
+## ============================================================================
+
+# Resolve the working directory a git sub-action runs in, in priority order:
+#   1. -Workspace <token>  -> that worktree's folder (Get-WorkingCopies; -App
+#      scopes the search, "All" searches every mapped app).
+#   2. -RepoPath <dir>     -> an explicit folder.
+#   3. the current directory, IF it is inside a git work tree.
+# Returns the path, or $null (with a message) when nothing usable is found.
+function Resolve-GitWorkDir {
+    param($App = "All")
+    if (-not [string]::IsNullOrWhiteSpace($Workspace)) {
+        $wc = @(Get-WorkingCopies -App $App | Where-Object { $_.Token -ieq $Workspace })[0]
+        if ($wc) { return $wc.WorktreePath }
+        Write-Message ("  -Workspace '{0}' not found for app {1} under {2}." -f $Workspace, $App, $GitReposRoot) -Fore Red
+        return $null
+    }
+    if (-not [string]::IsNullOrWhiteSpace($RepoPath)) {
+        if (Test-Path -Path $RepoPath) { return $RepoPath }
+        Write-Message ("  -RepoPath not found: {0}" -f $RepoPath) -Fore Red
+        return $null
+    }
+    $here = (Get-Location).Path
+    $inside = $null
+    try { $inside = & git -C "$here" rev-parse --is-inside-work-tree 2>$null } catch { $inside = $null }
+    if (($inside | Select-Object -First 1) -match '^(?i)true$') { return $here }
+    Write-Message "  No working copy selected.  Use -Workspace <token> or -RepoPath <dir>," -Fore Red
+    Write-Message "  or run from inside a git working copy." -Fore Red
+    return $null
+}
+
+# The short branch name HEAD points at in a work tree (or "" if detached/none).
+function Get-GitCurrentBranch {
+    param($WorkDir)
+    $b = ""
+    try { $b = (& git -C "$WorkDir" rev-parse --abbrev-ref HEAD 2>$null | Select-Object -First 1) } catch { $b = "" }
+    if ($b -eq "HEAD") { $b = "" }
+    return ($b | ForEach-Object { "$_".Trim() })
+}
+
+# Run a read-only git command in $WorkDir and echo its output verbatim (these
+# change nothing, so they run even under -DryRun).  Keeps git's own formatting.
+function Show-Git {
+    param($WorkDir, [string[]]$Arguments, $Heading)
+    if ($Heading) { Write-Message $Heading -Fore Cyan }
+    Write-Message ("  > git " + ($Arguments -join ' ')) -Fore DarkGray
+    try {
+        $out = & git -C "$WorkDir" @Arguments 2>&1 | Out-String
+    } catch {
+        Write-Message ("  git error: {0}" -f $_.Exception.Message) -Fore Red; $script:OnError = $true; return
+    }
+    if ($out.Trim()) { Write-Host $out.TrimEnd() } else { Write-Message "  (no output)" -Fore DarkGray }
+    Write-Host ""
+}
+
+# -GitStatus: status + ahead/behind upstream + commits waiting on the server.
+function Invoke-GitStatus {
+    param($App = "All")
+    Write-Section "GIT - STATUS"
+    $wd = Resolve-GitWorkDir -App $App; if (-not $wd) { $script:OnError = $true; return }
+    $br = Get-GitCurrentBranch -WorkDir $wd
+    Write-Message ("Working copy: {0}   Branch: {1}" -f $wd, $(if ($br) { $br } else { "(detached)" })) -Fore Blue
+    Show-Git -WorkDir $wd -Arguments @("status","-sb") -Heading "Status (short):"
+    if ($br) {
+        Show-Git -WorkDir $wd -Arguments @("log","--oneline","HEAD..origin/$br") -Heading "Waiting on origin/$br (a pull would bring these in):"
+    }
+}
+
+# -GitDiff: uncommitted changes, or (with -DiffVs <ref>) the diff against a ref.
+function Invoke-GitDiff {
+    param($App = "All")
+    Write-Section "GIT - DIFF"
+    $wd = Resolve-GitWorkDir -App $App; if (-not $wd) { $script:OnError = $true; return }
+    if (-not [string]::IsNullOrWhiteSpace($DiffVs)) {
+        Show-Git -WorkDir $wd -Arguments @("diff","--stat",$DiffVs) -Heading ("Changed files vs {0}:" -f $DiffVs)
+        Show-Git -WorkDir $wd -Arguments @("diff",$DiffVs) -Heading ("Diff vs {0}:" -f $DiffVs)
+    } else {
+        Show-Git -WorkDir $wd -Arguments @("diff","--stat") -Heading "Changed files (uncommitted):"
+        Show-Git -WorkDir $wd -Arguments @("diff") -Heading "Uncommitted diff:"
+    }
+}
+
+# -GitLog: compact, graphed, decorated recent history.
+function Invoke-GitLog {
+    param($App = "All")
+    Write-Section "GIT - LOG"
+    $wd = Resolve-GitWorkDir -App $App; if (-not $wd) { $script:OnError = $true; return }
+    Show-Git -WorkDir $wd -Arguments @("log","--oneline","--graph","--decorate","-30") -Heading "Recent history (last 30):"
+}
+
+# -GitStashList: what you've shelved.
+function Invoke-GitStashList {
+    param($App = "All")
+    Write-Section "GIT - STASH LIST"
+    $wd = Resolve-GitWorkDir -App $App; if (-not $wd) { $script:OnError = $true; return }
+    Show-Git -WorkDir $wd -Arguments @("stash","list") -Heading "Stashes:"
+}
+
+# -GitStash: shelve uncommitted changes so you can switch tasks with a clean tree.
+function Invoke-GitStash {
+    param($App = "All")
+    Write-Section "GIT - STASH (shelve uncommitted changes)"
+    $wd = Resolve-GitWorkDir -App $App; if (-not $wd) { $script:OnError = $true; return }
+    Show-Git -WorkDir $wd -Arguments @("status","-sb") -Heading "Before stashing:"
+    [void](Invoke-Git -Arguments @("-C",$wd,"stash","push","-m","OEAdmin stash $(Get-Date -Format 'yyyy-MM-dd HH:mm')") -Label "stash push")
+    if ($DryRun -ne $true) { Write-Message "  Shelved.  Restore later with -Git -GitStashPop (git stash pop)." -Fore Green }
+}
+
+# -GitStashPop: restore the most recently shelved changes.
+function Invoke-GitStashPop {
+    param($App = "All")
+    Write-Section "GIT - STASH POP (restore shelved changes)"
+    $wd = Resolve-GitWorkDir -App $App; if (-not $wd) { $script:OnError = $true; return }
+    [void](Invoke-Git -Arguments @("-C",$wd,"stash","pop") -Label "stash pop")
+    if ($DryRun -ne $true) { Show-Git -WorkDir $wd -Arguments @("status","-sb") -Heading "After pop:" }
+}
+
+# -GitCommit: guarded stage + commit.  -Message REQUIRED.  -AddAll stages
+# everything first; else only already-staged changes.  Shows status + staged diff
+# and confirms (unless -Yes).  Never amends/force.
+function Invoke-GitCommit {
+    param($App = "All")
+    Write-Section "GIT - COMMIT"
+    if ([string]::IsNullOrWhiteSpace($Message)) {
+        Write-Message "  -GitCommit requires -Message ""...""  (a short what + why; no empty messages)." -Fore Red
+        $script:OnError = $true; return
+    }
+    $wd = Resolve-GitWorkDir -App $App; if (-not $wd) { $script:OnError = $true; return }
+    $br = Get-GitCurrentBranch -WorkDir $wd
+    Write-Message ("Working copy: {0}   Branch: {1}" -f $wd, $(if ($br) { $br } else { "(detached)" })) -Fore Blue
+    if ($AddAll -eq $true) { [void](Invoke-Git -Arguments @("-C",$wd,"add","-A") -Label "add -A") }
+    Show-Git -WorkDir $wd -Arguments @("status","-sb") -Heading "Status:"
+    Show-Git -WorkDir $wd -Arguments @("diff","--staged","--stat") -Heading "Staged for commit:"
+    if ($DryRun -ne $true) {
+        $staged = ""
+        try { $staged = & git -C "$wd" diff --staged --name-only 2>$null | Out-String } catch { $staged = "" }
+        if ([string]::IsNullOrWhiteSpace($staged)) {
+            Write-Message "  Nothing staged to commit.  Use -AddAll to stage everything, or" -Fore Yellow
+            Write-Message "  `git add <file>` the specific files you want, then re-run." -Fore Yellow
+            return
+        }
+    }
+    Write-Message ("Commit message: {0}" -f $Message) -Fore Blue
+    if ($Yes -ne $true -and $DryRun -ne $true) {
+        if (-not (Read-YesNo -Prompt "Create this commit?" -Default:$false)) { Write-Message "  Cancelled - nothing committed." -Fore Yellow; return }
+    }
+    if (Invoke-Git -Arguments @("-C",$wd,"commit","-m",$Message) -Label "commit") {
+        if ($DryRun -ne $true) { Write-Message "  Committed.  Push it up with -Git -GitPush." -Fore Green }
+    }
+}
+
+# -GitPush: push the current branch.  First push (no upstream) auto-adds
+# `-u origin <branch>`; later pushes are plain.  Shows what's ahead, confirms
+# (unless -Yes).  Never --force.
+function Invoke-GitPush {
+    param($App = "All")
+    Write-Section "GIT - PUSH"
+    $wd = Resolve-GitWorkDir -App $App; if (-not $wd) { $script:OnError = $true; return }
+    $br = Get-GitCurrentBranch -WorkDir $wd
+    if (-not $br) {
+        Write-Message "  Detached HEAD (no branch) - nothing to push.  Switch to a branch first." -Fore Red
+        $script:OnError = $true; return
+    }
+    Write-Message ("Working copy: {0}   Branch: {1}" -f $wd, $br) -Fore Blue
+    $hasUpstream = $false
+    if ($DryRun -ne $true) {
+        try {
+            & git -C "$wd" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>$null | Out-Null
+            $hasUpstream = ($LASTEXITCODE -eq 0)
+        } catch { $hasUpstream = $false }
+    } else { $hasUpstream = $true }
+    if ($hasUpstream) {
+        Show-Git -WorkDir $wd -Arguments @("log","--oneline",'@{u}..HEAD') -Heading "Commits to push (ahead of upstream):"
+    } else {
+        Write-Message ("  No upstream set yet - first push will set it (-u origin {0})." -f $br) -Fore Yellow
+    }
+    if ($Yes -ne $true -and $DryRun -ne $true) {
+        if (-not (Read-YesNo -Prompt "Push now?" -Default:$false)) { Write-Message "  Cancelled - nothing pushed." -Fore Yellow; return }
+    }
+    if ($hasUpstream) {
+        [void](Invoke-Git -Arguments @("-C",$wd,"push") -Label "push")
+    } else {
+        [void](Invoke-Git -Arguments @("-C",$wd,"push","-u","origin",$br) -Label "push -u")
+    }
+}
+
+# -GitHelp: print a "day in the life" cheat sheet.  Prints only - nothing runs.
+function Invoke-GitHelp {
+    Write-Section "GIT - DAY IN THE LIFE (cheat sheet)"
+    $lines = @(
+        "OEAdmin wraps the safe, everyday git calls (status/diff/log/stash/commit/push)",
+        "so you don't have to memorize them.  The raw commands are below so you can see",
+        "what's happening - and for the few things OEAdmin leaves to you on purpose.",
+        "",
+        "-- Start the day: update your working copy ------------------------------------",
+        "  OEAdmin: -Git -UpdateRepos            (fast-forward every worktree, safe)",
+        "  raw git: git pull     (or: git fetch; git log HEAD..origin/<br>; git merge)",
+        "",
+        "-- Start new work: a branch as its own working copy ---------------------------",
+        "  OEAdmin: -Git -NewWorkspace -App <app> -BaseBranch <base> -NewBranch <new>",
+        "  raw git: git switch -c feature/TICKET-123-desc      (in an existing clone)",
+        "  naming : feature/...  bugfix/...  hotfix/...  experiment/...",
+        "",
+        "-- See what changed -----------------------------------------------------------",
+        "  OEAdmin: -Git -GitStatus              (status + what's waiting on the server)",
+        "           -Git -GitDiff                (your uncommitted changes)",
+        "           -Git -GitDiff -DiffVs origin/main     (what I changed vs production)",
+        "           -Git -GitLog                 (pretty history)",
+        "  raw git: git status ; git diff ; git diff <file> ; git log --oneline --graph",
+        "",
+        "-- Stage + commit (small + often) ---------------------------------------------",
+        "  OEAdmin: -Git -GitCommit -AddAll -Message ""what + why""",
+        "  raw git: git add <file>   (or git add .) ; git commit -m ""...""",
+        "  good   : ""Prevent save when status is inactive""      weak: ""stuff""",
+        "",
+        "-- Push your work -------------------------------------------------------------",
+        "  OEAdmin: -Git -GitPush                (first push sets -u automatically)",
+        "  raw git: git push      (first time: git push -u origin <branch>)",
+        "",
+        "-- Park work to jump to something else ----------------------------------------",
+        "  OEAdmin: -Git -GitStash    then later   -Git -GitStashPop     (-GitStashList)",
+        "  raw git: git stash ; git stash pop ; git stash list",
+        "",
+        "-- Things OEAdmin does NOT automate (do these yourself, on purpose) ------------",
+        "  Rebase onto latest main (cleaner history before a PR):",
+        "      git fetch ; git rebase origin/main",
+        "      (conflicts) edit files ; git add <file> ; git rebase --continue",
+        "  Push a rebased branch (history changed) - NEVER plain --force:",
+        "      git push --force-with-lease",
+        "  Resolve a merge conflict from a pull:",
+        "      edit the <<<<<<< / ======= / >>>>>>> markers ; git add <file> ; git commit",
+        "  Plain branch switch inside one working copy (vs OEAdmin's worktree model):",
+        "      git switch <branch>    /    git switch -c <new-branch>",
+        "",
+        "-- Before a pull request ------------------------------------------------------",
+        "  git diff origin/main                   (review the whole change)",
+        "  git log origin/main..HEAD --oneline    (make each commit tell a story)",
+        "",
+        "Rule of thumb (coming from a lock-based VCS): commit small, commit often,",
+        "branch liberally.  Git is built around frequent local commits."
+    )
+    foreach ($ln in $lines) { Write-Host ("  " + $ln) }
+    Write-Host ""
+}
+
 # -Ini / -Pf override the auto-derived paths.  In -DryRun the command is printed.
 function Do-Client {
     param($Item)
@@ -1478,9 +2247,15 @@ function Do-Client {
     $cargs = @("-ininame", $L.Ini, "-pf", $L.Pf)
     $dargs = @("-ininame", (Split-Path $L.Ini -Leaf), "-pf", (Split-Path $L.Pf -Leaf))
     foreach ($ap in $L.AddPfs) { $cargs += @("-pf", $ap); $dargs += @("-pf", (Split-Path $ap -Leaf)) }
-    # -Run / -Editor / -AppBuilder / -Desktop / -Dict / -Admin each add one "-p".
-    $runPgm = Get-ClientRunProgram
-    if ($runPgm) { $cargs += @("-p", $runPgm); $dargs += @("-p", $runPgm) }
+    # -Tool / -Run / -Editor / -AppBuilder / -Desktop / -Dict / -Admin add one "-p"
+    # (the resolved tool may include trailing Extra args, so split on whitespace:
+    # first token is the program, the rest are extra client args).
+    $runPgm = Get-ClientRunProgram -App $Item.App
+    if ($runPgm) {
+        $toks = @($runPgm -split '\s+' | Where-Object { $_ })
+        $cargs += @("-p", $toks[0]); $dargs += @("-p", $toks[0])
+        foreach ($x in ($toks | Select-Object -Skip 1)) { $cargs += $x; $dargs += $x }
+    }
 
     $display = "$($L.ExeName) " + ($dargs -join ' ')
     Write-Message ("Client: {0,-43} {1}" -f (& $Label $Item), $L.ExeName) -Fore Cyan
@@ -1490,9 +2265,17 @@ function Do-Client {
     }
     Write-Message ("  {0}" -f $display) -Fore DarkGray
     $prev = $env:DLC; $env:DLC = $Item.DLC
+    # -Workspace: run prowin with its working directory set to the worktree app
+    # folder; no workspace -> prowin's default working dir.
+    $workDir = Get-WorkspaceWorkDir -App $Item.App
+    if ($workDir) { Write-Message ("  working dir: {0}" -f $workDir) -Fore DarkGray }
     try {
         # Launch the client without blocking the script (interactive session).
-        Start-Process -FilePath $L.Exe -ArgumentList $cargs
+        if ($workDir) {
+            Start-Process -FilePath $L.Exe -ArgumentList $cargs -WorkingDirectory $workDir
+        } else {
+            Start-Process -FilePath $L.Exe -ArgumentList $cargs
+        }
     } catch {
         Write-Message ("  ERROR launching client: {0}" -f $_.Exception.Message) -Fore Red
         $script:OnError = $true
@@ -1528,10 +2311,15 @@ function Do-Batch {
         return
     }
     Write-Message ("  {0}" -f $display) -Fore DarkGray
+    # -Workspace: run from the worktree app folder (same as -Client).
+    $workDir = Get-WorkspaceWorkDir -App $Item.App
+    if ($workDir) { Write-Message ("  working dir: {0}" -f $workDir) -Fore DarkGray }
     $prev = $env:DLC; $env:DLC = $Item.DLC
     try {
-        $p = Start-Process -FilePath $L.Exe -ArgumentList $cargs -NoNewWindow -Wait -PassThru `
-                -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+        $spArgs = @{ FilePath=$L.Exe; ArgumentList=$cargs; NoNewWindow=$true; Wait=$true; PassThru=$true;
+                     RedirectStandardOutput=$outFile; RedirectStandardError=$errFile }
+        if ($workDir) { $spArgs['WorkingDirectory'] = $workDir }
+        $p = Start-Process @spArgs
         if ($p.ExitCode -ne 0) {
             Write-Message ("  Batch program exited {0} (see {1})" -f $p.ExitCode, $errFile) -Fore Red
             $script:OnError = $true
@@ -1820,28 +2608,39 @@ function Invoke-SplitCopyAsync {
     return $true
 }
 
+# Resolve the destination dev server for -CopyBackup of a given app: an explicit
+# -Dest always wins; otherwise fall back to the per-app default in
+# $CopyDestDefaults.  Returns $null if nothing resolves (caller flags the error).
+function Resolve-CopyDest {
+    param($App)
+    if (-not [string]::IsNullOrWhiteSpace($Dest)) { return $Dest }
+    if ($CopyDestDefaults.ContainsKey($App))      { return $CopyDestDefaults[$App] }
+    return $null
+}
+
 # Copy production backups to the dev server.  MUST RUN ON THE PRODUCTION server:
 # the source is a plain LOCAL path (not UNC); the destination is the dev server's
-# NAMED share \\<CopyDestServer>\<BackupShareName>\... (not the admin drive$
-# share).  A .bk larger than $SplitThresholdBytes is binary-split into
-# $SplitSliceBytes slices (progress meter), each slice copied with retry/backoff;
-# the local slice is deleted as soon as it lands.  The dev side reassembles slices
-# at restore time (see Do-Restore / Join-BackupFile).  Files at/under the
-# threshold copy whole (same retry logic).  App1 backups live in a flat dir; App2
-# backups live in per-role subdirs (the subdir path is preserved on the dest).
+# NAMED share \\<DestServer>\<BackupShareName>\... (not the admin drive$ share).
+# $DestServer is resolved from -Dest or the per-app default (see Resolve-CopyDest).
+# A .bk larger than $SplitThresholdBytes is binary-split into $SplitSliceBytes
+# slices (progress meter), each slice copied with retry/backoff; the local slice
+# is deleted as soon as it lands.  The dev side reassembles slices at restore time
+# (see Do-Restore / Join-BackupFile).  Files at/under the threshold copy whole
+# (same retry logic).  App1 backups live in a flat dir; App2 backups live in
+# per-role subdirs (the subdir path is preserved on the dest).
 #
 # CHANGE THIS: the $destRoot build below uses the Windows "\\server\share" UNC
 # form.  On Linux, change it to however you reach the dev server's backup dir
 # (NFS/autofs mount, user@host:path over scp/rsync, etc.).
 function Invoke-CopyBackup {
-    param($App)
+    param($App, $DestServer)
     $srcDir = if ($App -eq "App1") { $App1BackupDir } else { $App2BackupBase }
     if (-not (Test-Path -Path $srcDir)) {
         Write-Message ("  CopyBackup: source dir not found on this (production) server: {0}" -f $srcDir) -Fore Red
         $script:OnError = $true; return
     }
     # Destination root on the dev server's NAMED share (NOT the admin drive$).
-    $destRoot = "\\{0}\{1}" -f $CopyDestServer, $BackupShareName.TrimStart('\')
+    $destRoot = "\\{0}\{1}" -f $DestServer, $BackupShareName.TrimStart('\')
     Write-Message ("Copy {0} backups: {1} -> {2}" -f $App, $srcDir, $destRoot) -Fore Cyan
 
     $bkFiles = @(Get-ChildItem -Path $srcDir -Filter "*.bk" -File -Recurse)
@@ -2127,6 +2926,7 @@ function Invoke-Menu {
         [pscustomobject]@{ Label="CopyBackup - split+push prod backups -> dev (run on PROD)"; Value="CopyBackup" }
         [pscustomobject]@{ Label="Client  - launch Progress GUI client";       Value="Client" }
         [pscustomobject]@{ Label="Batch   - run a Progress program in batch";  Value="Batch" }
+        [pscustomobject]@{ Label="Git     - local repo/worktree maintenance";  Value="Git" }
     )
     if ($null -eq $action) { return $false }
 
@@ -2135,7 +2935,14 @@ function Invoke-Menu {
     $script:Status=$false; $script:Start=$false; $script:Stop=$false
     $script:Restart=$false; $script:Backup=$false; $script:Restore=$false
     $script:CopyBackup=$false; $script:Client=$false; $script:Batch=$false
-    $script:AsyncCopy=$false
+    $script:AsyncCopy=$false; $script:Dest=""
+    $script:Git=$false; $script:UpdateRepos=$false
+    $script:NewWorkspace=$false; $script:BaseBranch=""; $script:NewBranch=""; $script:BootstrapClone=$false
+    $script:GitStatus=$false; $script:GitDiff=$false; $script:GitLog=$false
+    $script:GitStash=$false; $script:GitStashPop=$false; $script:GitStashList=$false
+    $script:GitCommit=$false; $script:GitPush=$false; $script:GitHelp=$false
+    $script:Message=""; $script:AddAll=$false; $script:DiffVs=""; $script:RepoPath=""; $script:Yes=$false
+    $script:Tool=""; $script:Workspace=""
     # Clear the mutually-exclusive -Client launch switches too.
     $script:Run=$false; $script:Editor=$false; $script:AppBuilder=$false
     $script:Desktop=$false; $script:Dict=$false; $script:Admin=$false
@@ -2238,6 +3045,26 @@ function Invoke-Menu {
             $script:CopyBackup = $true
             $app = & $askApp $true; if ($null -eq $app) { return $false }
             $script:App = $app
+            # Destination dev server.  For a specific app, offer a picker of all
+            # that app's Development servers, defaulting to its $CopyDestDefaults
+            # entry.  For -App All we leave -Dest blank so each app uses its own
+            # default (one picker can't serve both apps).
+            if ($app -ne "All") {
+                $devServers = @($Installs | Where-Object { $_.App -eq $app -and $_.Tier -eq "Development" } |
+                                Select-Object -ExpandProperty Server -Unique)
+                if ($devServers.Count -gt 0) {
+                    $defDest = if ($CopyDestDefaults.ContainsKey($app)) { $CopyDestDefaults[$app] } else { $devServers[0] }
+                    # Order so the app default is first (Read-MenuChoice defaults to the first valid option).
+                    $ordered = @($devServers | Sort-Object { if ($_ -eq $defDest) { 0 } else { 1 } }, { $_ })
+                    $destOpts = foreach ($s in $ordered) {
+                        $tag = if ($s -eq $defDest) { " (app default)" } else { "" }
+                        [pscustomobject]@{ Label=("{0}{1}" -f $s, $tag); Value=$s; Valid=$true }
+                    }
+                    $destPick = Read-MenuChoice -Title "Copy to which development server?" -Options $destOpts
+                    if ($null -eq $destPick) { return $false }
+                    $script:Dest = $destPick
+                }
+            }
             # Async (pipelined split+copy) is opt-in; prompt for it here.
             $script:AsyncCopy = Read-YesNo -Prompt "Use async (pipelined split+copy) for large backups?" -Default:$false
         }
@@ -2267,25 +3094,28 @@ function Invoke-Menu {
             $app = & $askApp $false; if ($null -eq $app) { return $false }
             $script:App = $app
             if (-not (& $askClientEnv $app)) { return $false }
-            # Launch program: at most one of the mutually-exclusive -p options.
-            $launch = Read-MenuChoice -Title "Launch into which program? (or none)" -Options @(
-                [pscustomobject]@{ Label="None (plain client)";           Value="None";       Valid=$true }
-                [pscustomobject]@{ Label="Startup program ($StartupProgram)"; Value="Run";     Valid=$true }
-                [pscustomobject]@{ Label="Procedure Editor (_edit.p)";     Value="Editor";     Valid=$true }
-                [pscustomobject]@{ Label="AppBuilder (_ab.p)";             Value="AppBuilder"; Valid=$true }
-                [pscustomobject]@{ Label="Desktop (_desk.p)";              Value="Desktop";    Valid=$true }
-                [pscustomobject]@{ Label="Data Dictionary (_dict.p)";      Value="Dict";       Valid=$true }
-                [pscustomobject]@{ Label="Data Administration (_admin.p)"; Value="Admin";      Valid=$true }
-            )
-            if ($null -eq $launch) { return $false }
-            switch ($launch) {
-                "Run"        { $script:Run        = $true }
-                "Editor"     { $script:Editor     = $true }
-                "AppBuilder" { $script:AppBuilder = $true }
-                "Desktop"    { $script:Desktop    = $true }
-                "Dict"       { $script:Dict       = $true }
-                "Admin"      { $script:Admin      = $true }
+            # Workspace picker: the installed code, or a git working copy (worktree).
+            # Only offered when worktrees are actually discovered for this app.
+            $wcs = @(Get-WorkingCopies -App $app)
+            if ($wcs.Count -gt 0) {
+                $wsOpts = @([pscustomobject]@{ Label="(installed code - no workspace)"; Value=""; Valid=$true })
+                foreach ($w in $wcs) { $wsOpts += [pscustomobject]@{ Label=("{0}  [{1}]" -f $w.Token, $w.Repo); Value=$w.Token; Valid=$true } }
+                $wsPick = Read-MenuChoice -Title "Launch from which working copy?" -Options $wsOpts
+                if ($null -eq $wsPick) { return $false }
+                $script:Workspace = $wsPick
+                if (-not [string]::IsNullOrWhiteSpace($script:Workspace)) {
+                    $script:UpdateRepos = Read-YesNo -Prompt "Fast-forward (pull) this working copy before launching?" -Default:$false
+                }
             }
+            # Launch program: pick a tool by NAME from the $Tools map (scoped to the
+            # app), plus "(none)".  Sets -Tool; the resolver maps it to a -p program.
+            $toolNames = @($Tools | Where-Object { $_.App -eq "" -or $_.App -eq $app } |
+                           Select-Object -ExpandProperty Name -Unique)
+            $toolOpts  = @([pscustomobject]@{ Label="(none - plain client)"; Value=""; Valid=$true })
+            foreach ($tn in $toolNames) { $toolOpts += [pscustomobject]@{ Label=$tn; Value=$tn; Valid=$true } }
+            $toolPick = Read-MenuChoice -Title "Launch into which tool/program?" -Options $toolOpts
+            if ($null -eq $toolPick) { return $false }
+            $script:Tool = $toolPick
             & $askIniPfOverride
         }
 
@@ -2299,6 +3129,131 @@ function Invoke-Menu {
             } while ([string]::IsNullOrWhiteSpace($pgmIn))
             $script:Pgm = $pgmIn
             & $askIniPfOverride
+        }
+
+        "Git" {
+            $script:Git = $true
+            # Two groups: everyday "day in the life" commands (operate in ONE working
+            # copy) and repo/worktree MAINTENANCE (operate across worktrees), plus a
+            # printed cheat sheet.
+            $gitCat = Read-MenuChoice -Title "Git - what do you want to do?" -Options @(
+                [pscustomobject]@{ Label="Daily workflow - status / diff / log / stash / commit / push"; Value="Daily" }
+                [pscustomobject]@{ Label="Maintenance    - update all worktrees / add a new working copy"; Value="Maint" }
+                [pscustomobject]@{ Label="Cheat sheet    - print the day-in-the-life git commands"; Value="Help" }
+            )
+            if ($null -eq $gitCat) { return $false }
+
+            if ($gitCat -eq "Help") { $script:GitHelp = $true }
+
+            elseif ($gitCat -eq "Daily") {
+                # Pick which working copy the command runs in.  Prefer a worktree from
+                # Get-WorkingCopies; if none are found, fall back to the current dir.
+                $allWcs = @(Get-WorkingCopies -App "All")
+                if ($allWcs.Count -gt 0) {
+                    $wsOpts = foreach ($w in $allWcs) { [pscustomobject]@{ Label=("{0}  [{1}]" -f $w.Token, $w.Repo); Value=$w.Token; Valid=$true } }
+                    $wsOpts += [pscustomobject]@{ Label="(current directory)"; Value=""; Valid=$true }
+                    $wsPick = Read-MenuChoice -Title "Which working copy?" -Options $wsOpts
+                    if ($null -eq $wsPick) { return $false }
+                    $script:Workspace = $wsPick
+                } else {
+                    Write-Host "  No worktrees discovered - the command will run in the current directory." -ForegroundColor Yellow
+                }
+                $daily = Read-MenuChoice -Title "Which git command?" -Options @(
+                    [pscustomobject]@{ Label="Status      - what changed + what's waiting on the server"; Value="GitStatus" }
+                    [pscustomobject]@{ Label="Diff        - your uncommitted changes"; Value="GitDiff" }
+                    [pscustomobject]@{ Label="Diff vs ... - compare against a ref (e.g. origin/main)"; Value="GitDiffVs" }
+                    [pscustomobject]@{ Label="Log         - recent history (graph)"; Value="GitLog" }
+                    [pscustomobject]@{ Label="Stash       - shelve uncommitted changes"; Value="GitStash" }
+                    [pscustomobject]@{ Label="Stash pop   - restore shelved changes"; Value="GitStashPop" }
+                    [pscustomobject]@{ Label="Stash list  - show shelved changes"; Value="GitStashList" }
+                    [pscustomobject]@{ Label="Commit      - stage + commit (asks for a message)"; Value="GitCommit" }
+                    [pscustomobject]@{ Label="Push        - push the current branch"; Value="GitPush" }
+                )
+                if ($null -eq $daily) { return $false }
+                switch ($daily) {
+                    "GitStatus"    { $script:GitStatus = $true }
+                    "GitDiff"      { $script:GitDiff = $true }
+                    "GitDiffVs"    {
+                        $script:GitDiff = $true
+                        do { $dv = (Read-Host "  Compare against which ref? (e.g. origin/main)").Trim() } while ([string]::IsNullOrWhiteSpace($dv))
+                        $script:DiffVs = $dv
+                    }
+                    "GitLog"       { $script:GitLog = $true }
+                    "GitStash"     { $script:GitStash = $true }
+                    "GitStashPop"  { $script:GitStashPop = $true }
+                    "GitStashList" { $script:GitStashList = $true }
+                    "GitCommit"    {
+                        $script:GitCommit = $true
+                        $script:AddAll = Read-YesNo -Prompt "Stage ALL changes first (git add -A)?" -Default:$true
+                        do { $msg = (Read-Host "  Commit message (what + why)").Trim() } while ([string]::IsNullOrWhiteSpace($msg))
+                        $script:Message = $msg
+                    }
+                    "GitPush"      { $script:GitPush = $true }
+                }
+            }
+
+            elseif ($gitCat -eq "Maint") {
+              $gitSub = Read-MenuChoice -Title "Which maintenance operation?" -Options @(
+                [pscustomobject]@{ Label="UpdateRepos  - fast-forward all worktrees (fetch + ff-only)"; Value="UpdateRepos" }
+                [pscustomobject]@{ Label="NewWorkspace - add a new working copy (worktree) for a branch"; Value="NewWorkspace" }
+              )
+              if ($null -eq $gitSub) { return $false }
+              switch ($gitSub) {
+                "UpdateRepos" {
+                    $script:UpdateRepos = $true
+                    # Optional: scope to one app's repos (All = every mapped repo).
+                    $gapp = & $askApp $true; if ($null -eq $gapp) { return $false }
+                    $script:App = $gapp
+                }
+                "NewWorkspace" {
+                    $script:NewWorkspace = $true
+                    # NewWorkspace needs a SPECIFIC app (one repo), not All.
+                    $gapp = & $askApp $false; if ($null -eq $gapp) { return $false }
+                    $script:App = $gapp
+                    $repo = @($GitRepoApps.Keys | Where-Object { $GitRepoApps[$_] -eq $gapp })[0]
+                    $bare = if ($repo) { Join-PathX $GitReposRoot $repo ".bare" } else { "" }
+                    # LAYOUT CHECK up front: if this machine isn't on the bare+worktree
+                    # layout, explain and let the operator choose to continue
+                    # (bootstrap a bare clone) or back out.
+                    $haveBare = ($bare -and (Test-BareLayout -Bare $bare))
+                    if (-not $haveBare) {
+                        Write-Host ""
+                        Write-Host "  No bare repo found at $bare." -ForegroundColor Yellow
+                        Write-Host "  -NewWorkspace expects the bare-clone + per-branch-worktree layout" -ForegroundColor Yellow
+                        Write-Host "  (each repo at <GitReposRoot>\<Repo>\.bare, one worktree per branch)." -ForegroundColor Yellow
+                        Write-Host "  This machine does not appear to use that layout." -ForegroundColor Yellow
+                        Write-Host "  Continuing will BOOTSTRAP a fresh bare clone here - a SEPARATE copy" -ForegroundColor Yellow
+                        Write-Host "  from any existing working clone you may already have." -ForegroundColor Yellow
+                        if (-not (Read-YesNo -Prompt "Bootstrap a bare clone and continue?" -Default:$false)) {
+                            Write-Host "  Cancelled - no git changes made." -ForegroundColor Yellow
+                            return $false
+                        }
+                        $script:BootstrapClone = $true
+                    }
+                    # Base branch: list the repo's branches so the operator picks one
+                    # (only possible once a bare repo exists).
+                    $branches = @()
+                    if ($haveBare) { $branches = @(Get-GitBranchList -Bare $bare) }
+                    if ($branches.Count -gt 0) {
+                        $brOpts = foreach ($b in $branches) { [pscustomobject]@{ Label=$b; Value=$b; Valid=$true } }
+                        $brPick = Read-MenuChoice -Title "Base the workspace on which branch?" -Options $brOpts
+                        if ($null -eq $brPick) { return $false }
+                        $script:BaseBranch = $brPick
+                    } else {
+                        do { $bIn = Read-Host "  Base branch name (e.g. main)" } while ([string]::IsNullOrWhiteSpace($bIn))
+                        $script:BaseBranch = $bIn.Trim()
+                    }
+                    # Optionally cut a NEW branch off the base.
+                    if (Read-YesNo -Prompt "Create a new branch off this base?" -Default:$false) {
+                        do {
+                            $nbIn = (Read-Host "  New branch name").Trim()
+                            if ([string]::IsNullOrWhiteSpace($nbIn)) { Write-Host "  Name cannot be blank." -ForegroundColor Yellow; continue }
+                            if (-not (Test-GitWorkspaceName $nbIn)) { Write-Host '  Invalid characters (no \ / : * ? " < > |).' -ForegroundColor Yellow; $nbIn = "" }
+                        } until (-not [string]::IsNullOrWhiteSpace($nbIn))
+                        $script:NewBranch = $nbIn
+                    }
+                }
+            }
         }
     }
 
@@ -2316,10 +3271,31 @@ function Invoke-Menu {
     if ($script:Desktop    -eq $true)               { $parts += "-Desktop" }
     if ($script:Dict       -eq $true)               { $parts += "-Dict" }
     if ($script:Admin      -eq $true)               { $parts += "-Admin" }
+    if (-not [string]::IsNullOrWhiteSpace($script:Tool))      { $parts += "-Tool $($script:Tool)" }
+    if (-not [string]::IsNullOrWhiteSpace($script:Workspace)) { $parts += "-Workspace $($script:Workspace)" }
+    if ($script:UpdateRepos -eq $true)              { $parts += "-UpdateRepos" }
+    if ($script:NewWorkspace -eq $true)             { $parts += "-NewWorkspace" }
+    if (-not [string]::IsNullOrWhiteSpace($script:BaseBranch)) { $parts += "-BaseBranch $($script:BaseBranch)" }
+    if (-not [string]::IsNullOrWhiteSpace($script:NewBranch))  { $parts += "-NewBranch $($script:NewBranch)" }
+    if ($script:BootstrapClone -eq $true)           { $parts += "-BootstrapClone" }
+    if ($script:GitStatus -eq $true)                { $parts += "-GitStatus" }
+    if ($script:GitDiff -eq $true)                  { $parts += "-GitDiff" }
+    if (-not [string]::IsNullOrWhiteSpace($script:DiffVs)) { $parts += "-DiffVs $($script:DiffVs)" }
+    if ($script:GitLog -eq $true)                   { $parts += "-GitLog" }
+    if ($script:GitStash -eq $true)                 { $parts += "-GitStash" }
+    if ($script:GitStashPop -eq $true)              { $parts += "-GitStashPop" }
+    if ($script:GitStashList -eq $true)             { $parts += "-GitStashList" }
+    if ($script:GitCommit -eq $true)                { $parts += "-GitCommit" }
+    if ($script:AddAll -eq $true)                   { $parts += "-AddAll" }
+    if (-not [string]::IsNullOrWhiteSpace($script:Message)) { $parts += "-Message `"$($script:Message)`"" }
+    if ($script:GitPush -eq $true)                  { $parts += "-GitPush" }
+    if ($script:GitHelp -eq $true)                  { $parts += "-GitHelp" }
+    if (-not [string]::IsNullOrWhiteSpace($script:RepoPath)) { $parts += "-RepoPath `"$($script:RepoPath)`"" }
     if (-not [string]::IsNullOrWhiteSpace($script:Pgm)) { $parts += "-Pgm $($script:Pgm)" }
     if (-not [string]::IsNullOrWhiteSpace($script:Ini)) { $parts += "-Ini `"$($script:Ini)`"" }
     if (-not [string]::IsNullOrWhiteSpace($script:Pf))  { $parts += "-Pf `"$($script:Pf)`"" }
     if (@($script:AddPfs).Count -gt 0) { $parts += "-AddPfs `"$(@($script:AddPfs) -join ',')`"" }
+    if (-not [string]::IsNullOrWhiteSpace($script:Dest)) { $parts += "-Dest $($script:Dest)" }
     if ($script:AsyncCopy -eq $true)                { $parts += "-AsyncCopy" }
     if ($script:DryRun -eq $true)                   { $parts += "-DryRun" }
     $cmd = $parts -join ' '
@@ -2407,6 +3383,56 @@ function Test-EnvAvail  { param($App, $Site, $Env)   # any of App/Site may be Al
 # equivalent command line, and on confirm sets the $script: vars used below.
 if ($Menu -eq $true) {
     if (-not (Invoke-Menu)) { Write-Section "SCRIPT COMPLETED"; exit 0 }
+}
+
+# GIT ACTION GROUP - local repo/worktree maintenance; does NOT need the OpenEdge
+# inventory, so it runs and exits before the DB dispatch.  Extensible: dispatch a
+# git sub-action switch (today -UpdateRepos / -NewWorkspace).
+if ($Git -eq $true) {
+    Write-Section "OEADMIN - GIT"
+    Write-Message "GitReposRoot: $GitReposRoot   App: $App   DryRun: $DryRun" -Fore Blue
+    if ($NewWorkspace -eq $true) {
+        Write-Message "NewWorkspace: BaseBranch=$BaseBranch  NewBranch=$NewBranch  BootstrapClone=$BootstrapClone" -Fore Blue
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Workspace)) { Write-Message "Workspace: $Workspace" -Fore Blue }
+    if (-not [string]::IsNullOrWhiteSpace($RepoPath))  { Write-Message "RepoPath:  $RepoPath"  -Fore Blue }
+    # Dispatch exactly one sub-action (menu enforces one; on the CLI first match
+    # wins).  Maintenance first, then the day-in-the-life set.
+    if ($UpdateRepos -eq $true) {
+        Invoke-UpdateRepos -App $App
+    } elseif ($NewWorkspace -eq $true) {
+        Invoke-NewWorkspace -App $App -BaseBranch $BaseBranch -NewBranch $NewBranch -BootstrapClone:$BootstrapClone
+    } elseif ($GitStatus -eq $true) {
+        Invoke-GitStatus -App $App
+    } elseif ($GitDiff -eq $true) {
+        Invoke-GitDiff -App $App
+    } elseif ($GitLog -eq $true) {
+        Invoke-GitLog -App $App
+    } elseif ($GitStash -eq $true) {
+        Invoke-GitStash -App $App
+    } elseif ($GitStashPop -eq $true) {
+        Invoke-GitStashPop -App $App
+    } elseif ($GitStashList -eq $true) {
+        Invoke-GitStashList -App $App
+    } elseif ($GitCommit -eq $true) {
+        Invoke-GitCommit -App $App
+    } elseif ($GitPush -eq $true) {
+        Invoke-GitPush -App $App
+    } elseif ($GitHelp -eq $true) {
+        Invoke-GitHelp
+    } else {
+        Write-Message "  No git sub-action given.  Maintenance:" -Fore Yellow
+        Write-Message "    -UpdateRepos                        fast-forward all worktrees" -Fore Yellow
+        Write-Message "    -NewWorkspace -App <a> -BaseBranch <b> [-NewBranch <n>]  add a worktree" -Fore Yellow
+        Write-Message "  Day-in-the-life (scope with -Workspace <token> / -RepoPath <dir> / current dir):" -Fore Yellow
+        Write-Message "    -GitStatus  -GitDiff [-DiffVs <ref>]  -GitLog" -Fore Yellow
+        Write-Message "    -GitStash   -GitStashPop  -GitStashList" -Fore Yellow
+        Write-Message "    -GitCommit -Message ""..."" [-AddAll] [-Yes]   -GitPush [-Yes]" -Fore Yellow
+        Write-Message "    -GitHelp                            print the cheat sheet" -Fore Yellow
+    }
+    Write-Section "SCRIPT COMPLETED"
+    if ($OnError -eq $true) { exit 2001 }
+    exit 0
 }
 
 Write-Section "OEADMIN - PARAMETERS"
@@ -2538,10 +3564,54 @@ if ($SettingsBackup -eq $true -and ($Stop -eq $true -or $Restart -eq $true -or $
     }
 }
 
+# Component gating for -Start/-Stop/-Restart: NameServer/MSSQLBroker components
+# are shared, server-wide resources, so we only start/stop them when the action
+# is a WHOLE-SERVER operation - i.e. the selection covers EVERY database that
+# install manages (within the -App filter).  If -Site/-Env (or -App) narrow the
+# selection to a subset of an install's databases, that install's components are
+# dropped from the state change (databases are still acted on normally).
+# Returns the subset of $Targets to act on for a state-change action.
+function Resolve-StateChangeTargets {
+    param($Targets, $Inventory)
+    $dbTargets = @($Targets | Where-Object Component -eq "Database")
+    $result    = New-Object System.Collections.Generic.List[object]
+    foreach ($t in $dbTargets) { $result.Add($t) }
+
+    foreach ($c in @($Targets | Where-Object { $_.Component -ne "Database" })) {
+        # All databases this install manages, per the FULL inventory, honoring -App.
+        $installDbs = @($Inventory | Where-Object {
+            $_.Component -eq "Database" -and
+            $_.Server    -eq $c.Server  -and
+            $_.OEVersion -eq $c.OEVersion -and
+            ($App -eq "All" -or $_.App -eq $App)
+        })
+        $selectedNames = @($dbTargets | Where-Object {
+            $_.Server -eq $c.Server -and $_.OEVersion -eq $c.OEVersion
+        } | ForEach-Object { $_.Name })
+        $allCovered = $true
+        if ($installDbs.Count -eq 0) {
+            # No databases discovered for this install (e.g. a NS-only box): treat
+            # as whole-server only when the selection isn't narrowed by Site/Env.
+            $allCovered = ($Site -eq "All" -and $Env -eq "All")
+        } else {
+            foreach ($d in $installDbs) {
+                if ($selectedNames -notcontains $d.Name) { $allCovered = $false; break }
+            }
+        }
+        if ($allCovered) {
+            $result.Add($c)
+        } else {
+            Write-Message ("  Skipping component (partial selection): {0,-6} {1} on {2}" -f `
+                $c.OEVersion, $c.Name, $c.Server) -Fore DarkGray
+        }
+    }
+    return $result
+}
+
 # STOP
 if ($Stop -eq $true) {
     Write-Section "STOP"
-    foreach ($t in $Targets) {
+    foreach ($t in (Resolve-StateChangeTargets -Targets $Targets -Inventory $Inventory)) {
         if (Test-CanAct -Item $t) { Do-Stop -Item $t }
     }
 }
@@ -2549,7 +3619,7 @@ if ($Stop -eq $true) {
 # RESTART
 if ($Restart -eq $true) {
     Write-Section "RESTART"
-    foreach ($t in $Targets) {
+    foreach ($t in (Resolve-StateChangeTargets -Targets $Targets -Inventory $Inventory)) {
         if (Test-CanAct -Item $t) { Do-Restart -Item $t }
     }
 }
@@ -2557,7 +3627,7 @@ if ($Restart -eq $true) {
 # START
 if ($Start -eq $true) {
     Write-Section "START"
-    foreach ($t in $Targets) {
+    foreach ($t in (Resolve-StateChangeTargets -Targets $Targets -Inventory $Inventory)) {
         if (Test-CanAct -Item $t) { Do-Start -Item $t }
     }
 }
@@ -2576,8 +3646,8 @@ if ($Backup -eq $true) {
 }
 
 # COPY BACKUPS - runs ON THE PRODUCTION server and PUSHES backups to the dev
-# server's named share (\\<CopyDestServer>\<BackupShareName>\...).  The source is
-# a plain LOCAL path, so this must run where the backups physically live (prod);
+# server's named share (\\<Dest>\<BackupShareName>\..., -Dest or per-app default).
+# The source is a plain LOCAL path, so this must run where the backups live (prod);
 # hence it is PRODUCTION-tier only.  Large .bk files are binary-split, the slices
 # copied with retry, and the dev side reassembles at restore time.  -App scopes
 # which app's backups are copied (All = both).
@@ -2593,7 +3663,12 @@ if ($CopyBackup -eq $true) {
         $script:OnError = $true
     }
     foreach ($a in $prodHere) {
-        Invoke-CopyBackup -App $a
+        $destServer = Resolve-CopyDest -App $a
+        if (-not $destServer) {
+            Write-Message ("  CopyBackup: no destination dev server resolved for {0} (set -Dest or add a `$CopyDestDefaults entry)." -f $a) -Fore Red
+            $script:OnError = $true; continue
+        }
+        Invoke-CopyBackup -App $a -DestServer $destServer
     }
 }
 
@@ -2659,6 +3734,11 @@ function Test-ClientTargets {
 # CLIENT - launch the Progress GUI client for a single environment.
 if ($Client -eq $true) {
     Write-Section "CLIENT (prowin/prowin32/_progres)"
+    # -UpdateRepos with a -Workspace: fast-forward the chosen working copy first.
+    if ($UpdateRepos -eq $true -and -not [string]::IsNullOrWhiteSpace($Workspace)) {
+        $wc = @(Get-WorkingCopies -App $App | Where-Object { $_.Token -ieq $Workspace })[0]
+        if ($wc) { Invoke-UpdateRepos -App $wc.App -OnlyRepo $wc.Repo -OnlyToken $wc.Token }
+    }
 
     # -Run / -Editor / -AppBuilder / -Desktop / -Dict / -Admin each supply the one
     # "-p" program on the client command line, so at most one may be set.
@@ -2694,6 +3774,11 @@ if ($Client -eq $true) {
 # target rules as -Client with one extra requirement: -Pgm <program>.p.
 if ($Batch -eq $true) {
     Write-Section "BATCH (prowin/prowin32/_progres -b)"
+    # -UpdateRepos with a -Workspace: fast-forward the chosen working copy first.
+    if ($UpdateRepos -eq $true -and -not [string]::IsNullOrWhiteSpace($Workspace)) {
+        $wc = @(Get-WorkingCopies -App $App | Where-Object { $_.Token -ieq $Workspace })[0]
+        if ($wc) { Invoke-UpdateRepos -App $wc.App -OnlyRepo $wc.Repo -OnlyToken $wc.Token }
+    }
 
     $havePgm = -not [string]::IsNullOrWhiteSpace($Pgm)
     if (-not $havePgm) {
@@ -2739,17 +3824,20 @@ exit 0
 ## CUSTOMIZATION CHECKLIST (search for "CHANGE THIS" to find each spot)
 ## ============================================================================
 ##  1. $Installs table .......... your servers, tiers, OpenEdge versions, DLCs,
-##                                ports, and each row's SetupDir (the -Client/
-##                                -Batch INI/PF root, per machine + version)
+##                                ports, each row's SetupDir (the -Client/-Batch
+##                                INI/PF root, per machine + version), and
+##                                InstalledComponents (which shared components -
+##                                NameServer/MSSQLBroker - that install runs)
 ##  2. -App ValidateSet ......... your application names (keep in sync with $Installs)
 ##  3. $ValidSites / -Site ...... your site codes (or drop sites if you have none)
 ##  4. Parse-App1Database /
 ##     Parse-App2Database ....... your database NAMING CONVENTION (the regex + maps)
 ##  5. Path defaults ............ $DlcBase, $App1BackupDir/$App2BackupBase
 ##                                (setup-tree roots now live in $Installs - item 1)
-##  5b. CopyBackup settings ..... $CopyDestServer, $BackupShareName, $SplitThreshold
-##                                Bytes/$SplitSliceBytes, $CopyMaxRetries/$CopyRetry
-##                                Delay, $AsyncCopy/$AsyncQueueDepth; and the
+##  5b. CopyBackup settings ..... $Dest/$CopyDestDefaults (dest dev server),
+##                                $BackupShareName, $SplitThresholdBytes/$SplitSlice
+##                                Bytes, $CopyMaxRetries/$CopyRetryDelay,
+##                                $AsyncCopy/$AsyncQueueDepth; and the
 ##                                $destRoot build in Invoke-CopyBackup (Windows UNC
 ##                                vs Linux mount/ssh)
 ##  6. Get-BackupDevice ......... your backup file names/layout

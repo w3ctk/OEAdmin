@@ -5,10 +5,13 @@ databases, NameServers, and (optionally) MS SQL DataServer brokers across any
 number of servers, sites, environments, and OpenEdge versions.
 
 It does **status / start / stop / restart / backup / restore / copy-backup**, can
-launch the Progress client (interactive or batch), scans database `.lg` logs for
-errors, checks broker ports, backs up your `conmgr`/`ubroker` properties before
-state changes, and can email a log/alert. It also has an interactive `-Menu` so
-operators don't have to memorize switches.
+launch the Progress client (interactive or batch, optionally from a **git working
+copy** with a rewritten PROPATH), scans database `.lg` logs for errors, checks
+broker ports, backs up your `conmgr`/`ubroker` properties before state changes,
+runs light **git** worktree maintenance plus everyday-git helpers for the git-shy
+(`-Git -UpdateRepos` / `-NewWorkspace` / `-GitStatus` / `-GitCommit` / `-GitPush` / `-GitHelp`), and can email a
+log/alert. It also has an interactive `-Menu` so operators don't have to memorize
+switches.
 
 `-CopyBackup` runs on the **production** server and **pushes** backups to a named
 share on the dev server; large `.bk` files are binary-**split** into slices
@@ -68,9 +71,11 @@ Everything below is marked `CHANGE THIS` in the script. In rough priority order:
 
 1. **`$Installs` table** — the heart of the config. One row per OpenEdge install:
    app, tier (Production/Development), server hostname, OpenEdge version, DLC
-   path, AdminServer port, and `SetupDir` (the client INI/PF root for that
-   install — kept per row because it can vary by machine and OE version). A
-   single server can have several rows (e.g. two OpenEdge versions side by side).
+   path, AdminServer port, `SetupDir` (the client INI/PF root for that install),
+   and `InstalledComponents` (which shared components — NameServer / MSSQLBroker /
+   OracleBroker — that install runs). `SetupDir` and `InstalledComponents` are
+   per row because they vary by machine and OE version. A single server can have
+   several rows (e.g. two OpenEdge versions side by side).
 2. **`-App` ValidateSet** — your application names (keep them in sync with
    `$Installs`).
 3. **`$ValidSites` / `-Site`** — your site codes (or drop sites if you have none).
@@ -81,10 +86,11 @@ Everything below is marked `CHANGE THIS` in the script. In rough priority order:
 5. **Path defaults** — `$DlcBase`, `$App1BackupDir` / `$App2BackupBase`. (The
    client INI/PF setup-tree root is **per install** now — each `$Installs` row's
    `SetupDir` — not a global, since it can differ by machine and OE version.)
-5b. **CopyBackup settings** — `$CopyDestServer`, `$BackupShareName`,
-   `$SplitThresholdBytes` / `$SplitSliceBytes`, `$CopyMaxRetries` /
-   `$CopyRetryDelay`, `$AsyncCopy` / `$AsyncQueueDepth`; and the destination-root
-   build in `Invoke-CopyBackup` (Windows UNC vs Linux mount/ssh).
+5b. **CopyBackup settings** — `$CopyDestDefaults` (per-app dest dev server;
+   `-Dest` overrides), `$BackupShareName`, `$SplitThresholdBytes` /
+   `$SplitSliceBytes`, `$CopyMaxRetries` / `$CopyRetryDelay`, `$AsyncCopy` /
+   `$AsyncQueueDepth`; and the destination-root build in `Invoke-CopyBackup`
+   (Windows UNC vs Linux mount/ssh).
 6. **`Get-BackupDevice`** — your backup file names/layout.
 7. **`Get-App2EnvStem`** — the INI/PF filename stem per environment for a
    single-site app.
@@ -94,6 +100,17 @@ Everything below is marked `CHANGE THIS` in the script. In rough priority order:
 10. **`Convert-ToRemotePath`** — only if you use `-Remote` (how to reach another
     server's paths).
 11. **`$StartupProgram`** — the `-Run` startup program, if you use one.
+12. **`$Tools` map** — the named launch programs a `-Client`/`-Batch` session can
+    run (`-Tool <name>`). Ships with Run/Editor/AppBuilder/Desktop/Dict/Admin;
+    add rows (Name/Pgm/Extra/App/Startup) for your own, no code change.
+13. **`$GitReposRoot` / `$GitRepoApps` / `$GitProjects`** — only if you launch
+    from git working copies. `$GitReposRoot` is where your bare-clone +
+    per-branch-worktree repos live (machine-aware default; override with the
+    param). `$GitRepoApps` maps a repo name to an app; `$GitProjects` maps a repo
+    to a clone URL (used only by `-Git -NewWorkspace -BootstrapClone`). Drives
+    `-Workspace`, `-Git -UpdateRepos`, and `-Git -NewWorkspace`. These assume the
+    bare+worktree layout; on a plain single clone they detect the missing `.bare`
+    and act safely (they won't clone blindly) — see the user manual §7.10.
 
 The example ships with **two applications** so you can see a multi-app,
 multi-tier, multi-version layout:
@@ -118,7 +135,8 @@ broker), runs each database name through the parser to learn its env/site, and
 builds a live inventory. Your **selector** switches (`-App`, `-Server`, `-Site`,
 `-Env`, `-OEVersion`, `-Component`) filter that inventory; your **action**
 switches say what to do. Commands go through the AdminServer via `dbman` /
-`nsman` / `mssman`.
+`nsman` / `mssman` / `oradvman`. Each install's `InstalledComponents` lists which
+shared components (NameServer / MSSQLBroker / OracleBroker) it actually runs.
 
 ---
 
@@ -146,6 +164,9 @@ switches say what to do. Commands go through the AdminServer via `dbman` /
 # ...same, but pipeline the split and the copy for a very large backup
 ./OEAdmin.ps1 -CopyBackup -App App1 -AsyncCopy
 
+# ...push to a specific dev server (otherwise the per-app default is used)
+./OEAdmin.ps1 -CopyBackup -App App1 -Dest dbserver1-dev
+
 # Restore the site-S2 production backup into the Test databases (reassembles
 # split slices first if the whole .bk isn't staged)
 ./OEAdmin.ps1 -Restore -App App1 -Site S2 -Env Test
@@ -153,8 +174,31 @@ switches say what to do. Commands go through the AdminServer via `dbman` /
 # Launch the App1 client for site-S1 Test (and run the startup program)
 ./OEAdmin.ps1 -Client -App App1 -Site S1 -Env Test -Run
 
+# ...launch a named tool from the $Tools map instead of -Run
+./OEAdmin.ps1 -Client -App App1 -Site S1 -Env Test -Tool Editor
+
+# Launch from a git WORKING COPY (worktree) instead of the installed code.
+# The INI's PROPATH is rewritten to point at the worktree (PF left untouched).
+./OEAdmin.ps1 -Client -App App1 -Site S1 -Env Test -Workspace my-feature-branch
+
+# ...and fast-forward (pull) that working copy first
+./OEAdmin.ps1 -Client -App App1 -Site S1 -Env Test -Workspace my-feature-branch -UpdateRepos
+
 # Run a program in batch
 ./OEAdmin.ps1 -Batch -App App1 -Site S1 -Env Test -Pgm sh/startup.p
+
+# Fast-forward every mapped repo's worktrees (fetch + merge --ff-only), standalone
+./OEAdmin.ps1 -Git -UpdateRepos
+./OEAdmin.ps1 -Git -UpdateRepos -App App1   # scope to one app's repos
+
+# Create a new working copy (worktree): a new feature branch cut off main
+./OEAdmin.ps1 -Git -NewWorkspace -App App1 -BaseBranch main -NewBranch my-fix
+
+# Everyday git in a working copy (status/diff/commit/push), for the git-shy
+./OEAdmin.ps1 -Git -GitStatus -Workspace my-fix
+./OEAdmin.ps1 -Git -GitCommit -Workspace my-fix -AddAll -Message "Add validation"
+./OEAdmin.ps1 -Git -GitPush   -Workspace my-fix
+./OEAdmin.ps1 -Git -GitHelp                      # cheat sheet of the daily commands
 
 # See all servers from one box (needs Convert-ToRemotePath set up)
 ./OEAdmin.ps1 -Remote
@@ -172,6 +216,10 @@ switches say what to do. Commands go through the AdminServer via `dbman` /
 - **Required `-Site` for multi-site restores.** When an app has multiple sites
   whose prod backups stage onto one dev server, `-Restore` refuses to run without
   an explicit `-Site`, so a restore can't silently hit both sites.
+- **Shared components only on a whole-server selection.** `-Start`/`-Stop`/
+  `-Restart` touch the NameServer / MSSQLBroker / OracleBroker only when the
+  selection covers every database an install manages; a narrowing `-Site`/`-Env`
+  leaves those shared components alone and acts on the selected databases only.
 - **Already-running / already-stopped are skipped**, not errored.
 - **`-DryRun`** prints the exact commands that would run and changes nothing.
 - **Settings backup.** Before a start/stop/restart, `conmgr.properties` and

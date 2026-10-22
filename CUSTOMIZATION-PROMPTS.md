@@ -36,7 +36,8 @@ Every question maps to a `CHANGE THIS` marker in the script.
 > (2) Applications; (3) Servers and installs; (4) OpenEdge versions;
 > (5) Database naming convention; (6) Sites/environments; (7) Backup layout &
 > copy-to-dev (split/push settings); (8) Client (INI/PF) setup layout;
-> (9) Email/SMTP; (10) Remote operation.
+> (9) Email/SMTP; (10) Remote operation; (11) Launch tools (the `$Tools` map);
+> (12) Git working copies (`-Workspace` / `-Git`, only if you launch from git).
 >
 > When the interview is complete:
 > - Produce the fully edited `OEAdmin.ps1` with every `CHANGE THIS` spot updated
@@ -83,9 +84,20 @@ For **each OpenEdge install** (a server + a DLC directory + a version):
 - **Q3.4** The **DLC** (OpenEdge install) path on that server.
 - **Q3.5** The **AdminServer port** for that install (default 20931; a second
   OE version on the same box uses a different port).
-  *Why:* these become the rows of `$Installs`. One server can have several rows.
+- **Q3.6** The **SetupDir** — the root of this install's `-Client`/`-Batch` INI/PF
+  tree (skip if you won't use the client). *Why:* sets each row's `SetupDir`; it's
+  per install because the root can differ by machine and OE version.
+- **Q3.7** Which **shared components** does this install run — NameServer,
+  MS SQL DataServer broker, Oracle DataServer broker, any combination, or none?
+  *Why:* sets each row's `InstalledComponents` allowlist, which gates what
+  `-Start`/`-Stop`/`-Restart` will touch (and is per install/AdminServer — two OE
+  versions on one box each declare their own).
+  *Why (the rows):* Q3.1–Q3.7 become the rows of `$Installs`. One server can have
+  several rows.
   *Where to find it:* AdminServer port is in the install's config /
-  `proadsv -query`; DLC is your `$DLC` env var.
+  `proadsv -query`; DLC is your `$DLC` env var; the components are the
+  `[NameServer.*]` / `[UBroker.MS.*]` / `[UBroker.OR.*]` sections in
+  `ubroker.properties`.
 
 ### Topic 4 — OpenEdge versions
 - **Q4.1** Which **OpenEdge versions** are in play across all installs?
@@ -120,11 +132,12 @@ For **each OpenEdge install** (a server + a DLC directory + a version):
   **local** path (not a share).
 - **Q7.2** Flat directory, or **per-role subdirectories**? *Why:* the subdir
   layout is preserved on the destination share by `Invoke-CopyBackup`.
-- **Q7.3** Which **dev server** do backups get pushed to, and what **named share**
-  on it maps to the backup directory? (e.g. server `dbserver1-dev`, share
-  `backups`.) *Why:* sets `$CopyDestServer` and `$BackupShareName`; the copy
-  destination is `\\<CopyDestServer>\<BackupShareName>\...` — deliberately **not**
-  the admin `drive$` share.
+- **Q7.3** Which **dev server** do each app's backups get pushed to, and what
+  **named share** on it maps to the backup directory? (e.g. App1 → `dbserver1-dev`,
+  App2 → `dbserver2-dev`, share `backups`.) *Why:* sets the per-app map
+  `$CopyDestDefaults` and `$BackupShareName`; the destination is
+  `\\<dest>\<BackupShareName>\...` — deliberately **not** the admin `drive$`
+  share. At run time `-Dest <server>` overrides the per-app default for a one-off.
 - **Q7.4** Are any backups large enough to want **splitting**? Default splits any
   `.bk` over 1 GB into 1 GB slices and can pipeline the copy (`-AsyncCopy`).
   *Why:* sets `$SplitThresholdBytes`, `$SplitSliceBytes`, `$AsyncQueueDepth`, and
@@ -154,6 +167,55 @@ For **each OpenEdge install** (a server + a DLC directory + a version):
   box? (Windows admin share `\\server\D$\...`, an NFS/autofs mount, ssh, …)
   *Why:* the AI will rewrite `Convert-ToRemotePath` to match. The shipped version
   uses the Windows UNC admin-share convention.
+
+### Topic 11 — Launch tools (the `$Tools` map)
+*(Skip if you only ever launch a plain client / `-Run`.)*
+- **Q11.1** Besides the startup program, what **named programs** do you launch via
+  the client? (e.g. a procedure editor, a data dictionary, an app-specific
+  console.) For each: a short **name**, the `.p`/`.r` it runs, any extra client
+  args, and whether it's **app-specific** or shared.
+  *Why:* sets the `$Tools` map (`Name`/`Pgm`/`Extra`/`App`/`Startup`) that
+  `-Tool <name>` and the menu's launch picker use. The template ships
+  Run/Editor/AppBuilder/Desktop/Dict/Admin; you just add rows.
+
+### Topic 12 — Git working copies (`-Workspace` / `-Git`)
+*(Skip unless you want to launch the client from a git working copy, or do light
+worktree maintenance, from this tool.)*
+- **Q12.1** Where do your git repos live on the machine(s) that run this, and is
+  the layout a **bare clone + per-branch worktree** (`<root>/<Repo>/.bare` plus a
+  worktree folder per branch)?
+  *Why:* sets `$GitReposRoot` (and its machine-aware default); if the layout
+  differs, the AI adjusts `Get-WorkingCopies` and the `AppPath` probe. This layout
+  is what `-Workspace`, `-Git -UpdateRepos`, and `-Git -NewWorkspace` assume — on a
+  plain single clone, `-NewWorkspace`/`-UpdateRepos` detect the missing `.bare` and
+  stop/skip safely rather than cloning blindly (see the user manual §7.10). **If
+  your developers are *not* standardized on this layout, say so** — the standalone
+  CreateGitWorkspace-style full-clone approach may suit them better, and you may
+  want to leave the git sub-actions unused.
+- **Q12.2** Which **repos map to which apps**? (e.g. `AppRepo` → `App1`.)
+  *Why:* sets `$GitRepoApps`; only mapped repos are discovered.
+- **Q12.3** When launching from a worktree, the client's PROPATH must point at the
+  worktree instead of the installed code. Confirm your **INI PROPATH** contains
+  the install root (the `SetupDir`) so the script can rewrite it, and that the
+  **PF** (DB connections) should stay unchanged.
+  *Why:* drives `Resolve-WorkspaceIni` (copy default INI + rewrite `PROPATH=`,
+  leave the PF alone).
+- **Q12.4** *(only if you want `-Git -NewWorkspace` to be able to create a repo
+  that doesn't exist locally yet)* What are the **clone URLs** for each repo?
+  *Why:* sets `$GitProjects` (repo → URL). `-NewWorkspace` uses it **only** when
+  you pass `-BootstrapClone` (or confirm the menu prompt) to create a fresh bare
+  clone; by default it never clones a repo that isn't already present, so a
+  developer on a different layout isn't handed a surprise second copy.
+- **Q12.5** *(nothing to configure — just so you know)* The **day-in-the-life**
+  git helpers (`-GitStatus` / `-GitDiff` / `-GitLog` / `-GitStash` /
+  `-GitStashPop` / `-GitStashList` / `-GitCommit` / `-GitPush` / `-GitHelp`) wrap
+  everyday git for developers who aren't comfortable on the command line. They
+  need **no** config: they run in whatever working copy you point them at
+  (`-Workspace`, `-RepoPath`, or the current directory). The write ones
+  (`-GitCommit` / `-GitPush`) confirm first and never `--force`; rebase, conflict
+  resolution and `push --force-with-lease` are intentionally left to the user and
+  only shown by `-GitHelp`. Nothing to answer here — just decide whether to tell
+  your team about them.
 
 ---
 
