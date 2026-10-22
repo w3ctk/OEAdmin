@@ -251,6 +251,32 @@ relative to the source root) and pass `-ExcludeFile compile-excludes.txt`. If yo
 support a very old OpenEdge (9.x), note `OECompiler.p` is written in pre-11 ABL on
 purpose so it compiles there too.
 
+### Topic 14 — Package (`-Package`) — almost nothing to configure
+
+*(Informational — one optional default.)* `-Package` builds a release bundle from
+one project's change set. It reuses the `-Compile` machinery, so like `-Compile`
+it needs **no** environment customization beyond what `-Client`/`-Batch` already
+have. Two assumptions to know:
+
+- It runs against a **local git worktree** (`-Workspace`); `-Remote` is refused.
+  So the box running `-Package` needs the repo checked out with the bare-clone +
+  worktree layout OEAdmin already uses for `-Workspace` (see Topic 12 / `-Git`).
+- The change set is read from git history (`-Grep` on commit messages,
+  `-FromCommit`..`-ToCommit`, or an explicit `-FileList`). The advisory
+  marker-drift check looks for an inline change marker of the form
+  `/* XX 2026-01-31 ... changes */`; if your team uses a different marker style it
+  simply reports no match (it never blocks), so there is nothing to change.
+
+The **one** optional default is **`-PackageBackupDir`**: the backup-before-
+overwrite root baked into the generated `deploy.ps1`. Blank falls back to the
+App1 backup dir; set it (CLI or the default in the param block) to wherever
+deploy-time backups should land on your target servers. Everything else — the zip
+name, manifest, dependency-aware r-code set, and the fail-closed compile against
+the required `-Site`/`-Env` — is automatic. Delta schema files passed with
+`-DeltaDf` are bundled and the generated `deploy.ps1` **prints** the DBA load
+steps and awaits confirmation; it never loads a `.df` itself, so no DB credentials
+live in the bundle.
+
 ---
 
 ## Part 3 — After customizing

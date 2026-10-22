@@ -92,7 +92,7 @@ as a Database with `Role="Extra"` and `Site`/`Env="All"`.
   `-OEVersion`, `-Component`.
 - **Actions** say what to do to the selection: `-Status` (default), `-Start`,
   `-Stop`, `-Restart`, `-Backup`, `-Restore`, `-CopyBackup`, `-Client`,
-  `-Batch`, `-Compile`, and the interactive `-Menu`.
+  `-Batch`, `-Compile`, `-Package`, and the interactive `-Menu`.
 
 ### 2.4 Tiers and the safety guard
 
@@ -511,6 +511,89 @@ If any file has a compiler **error**, `OECompiler.p` exits non-zero and OEAdmin
 flags it loudly (red, with the error count and the path to `compile.log`) and sets
 the error flag — so a broken compile is impossible to miss.
 
+### 7.9b `-Package` (release bundler)
+
+`-Package` turns **one project's change set** into a versioned, auditable release
+**bundle** (a zip): the **changed source**, a **dependency-aware** set of
+**freshly-compiled r-code**, any schema **delta `.df`** files, a **manifest**
+(JSON + text), and a safe self-deploying **`deploy.ps1`** with rollback. It reuses
+the same launch machinery as `-Compile`/`-Batch`, so it compiles against the same
+INI/PF/PROPATH and database connections.
+
+`-Site` and `-Env` are both **required** — the r-code CRC is tied to the schema it
+compiles against. `-Package` is a **local** build action: it must run against a
+local git **worktree** (`-Workspace`), and `-Remote` is refused.
+
+**Two passes (resolve → accept).** `-Package` is gated so you review the change
+set before anything is built:
+
+1. **Resolve** (no `-Accept`): unions the change-set inputs, writes a human-
+   reviewable `packages/<project>.changeset.txt` carrying a **hash** of the set,
+   prints the file list, and stops — no compile, no zip.
+2. **Accept** (`-Accept`, which **requires `-Project <tok>`**): re-resolves and
+   **hard-stops** unless the fresh set still matches the reviewed hash, then runs
+   one full, xref-on, **fail-closed** compile against `-Site`/`-Env`, computes the
+   dependency-aware r-code ship set from the XREF, confirms any delta DFs are
+   loaded, and assembles + zips the bundle.
+
+`-DryRun` previews either pass without writing anything.
+
+**Resolving the change set.** Provide at least one of these (they union; any mix),
+or `-Full`:
+
+| Input | Resolves to |
+|-------|-------------|
+| `-Grep "<text>"` | Files touched by commits whose **message** matches (`git log --grep`, case-insensitive). |
+| `-FromCommit <sha>` + `-ToCommit <sha>` | Files changed across the commit **range**. Both required together. |
+| `-FileList <file>` | An **explicit** list of paths (one per line, `#` comments ok). |
+| `-Full` | Skip resolution; recompile and ship the **whole** source tree's r-code (DB/CRC-wide change). |
+
+All paths are normalized to **app-root-relative**.
+
+**What ships.** The **source** is the changed shippable source only (`.p .w .cls
+.i .t`). The **r-code** is a dependency-complete **superset**: the fresh compile's
+XREF maps each program to the includes/classes/procedures it pulls in, and r-code
+is shipped for the changed units **plus every unit that depends on a changed
+file** (so a changed `.i` doesn't orphan a caller). `-Full` ships the whole tree's
+r-code. The build is fail-closed: any compile error, an empty XREF, or a missing
+`.r` aborts the bundle.
+
+**Schema deltas.** `-DeltaDf "<file,...>"` carries `.df` files in the bundle's
+`df/` folder. OEAdmin never auto-loads them — the shipped `deploy.ps1` **prints
+the load steps for the DBA** and awaits confirmation before touching code. The
+accept pass also gates on a confirmation that the DF(s) are loaded into the
+compile DB (so the r-code CRC can be trusted): pass **`-DfLoadedConfirmed`**
+(non-interactive) or answer the prompt. It is **separate** from `-Accept`.
+
+**The bundle + `deploy.ps1`.** The zip (`packages/<project>_<stamp>.zip`) holds
+`source/`, `rcode/`, `df/`, `manifest.json`, `manifest.txt`, and `deploy.ps1`.
+`deploy.ps1` (run on the target server) is **safe by default**: dry-run unless
+`-Execute`, requires `-TargetRoot <app root>`, backs up each file (verified)
+before overwrite, prints/awaits the DF load, and supports `-Rollback -Stamp
+<set>`.
+
+```bash
+# Pass 1 - resolve + review (commit-message search), no build
+./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace feature-x -Grep "TICKET-123"
+
+# Pass 2 - accept the reviewed set (re-hashes; hard-stops on drift), build the zip
+./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace feature-x -Grep "TICKET-123" -Accept -Project TICKET-123
+
+# Carry a schema delta (deploy.ps1 prints DBA load steps + awaits them)
+./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace feature-x -Grep "TICKET-123" -Accept -Project TICKET-123 -DeltaDf "schema/delta.df"
+
+# Ship the whole tree's r-code (DB/CRC-wide change)
+./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace feature-x -Accept -Project FullRelease -Full
+```
+
+Then on the target server, from the unzipped bundle:
+
+```bash
+./deploy.ps1 -TargetRoot /opt/app1            # preview (changes nothing)
+./deploy.ps1 -TargetRoot /opt/app1 -Execute   # deploy (backs up first; awaits DF load)
+./deploy.ps1 -TargetRoot /opt/app1 -Rollback -Stamp 2026-10-22_141530 -Execute
+```
+
 ### 7.10 `-Git` (local repo/worktree maintenance)
 
 `-Git` is an extensible action group for git work. It has two **maintenance**
@@ -754,6 +837,10 @@ Actions: `-Menu`, `-Status`, `-Start`, `-Stop`, `-Restart`, `-Backup`,
 Compile: `-Compile` (headless Application Compiler via `OECompiler.p`),
 `-FileSpec` (default `*.p *.w *.cls *.t`), `-Dir`, `-Incremental`, `-Listing`,
 `-Xref`, `-XrefXml`, `-Installed`, `-Exclude`, `-ExcludeFile`.
+
+Package (release bundler): `-Package`, `-Project` (required with `-Accept`),
+`-Grep` / `-FromCommit` / `-ToCommit` / `-FileList` (change-set inputs), `-Full`,
+`-Accept`, `-DeltaDf`, `-DfLoadedConfirmed`, `-PackageBackupDir`.
 
 Client tools & workspaces: `-Tool` (named entry from the `$Tools` map),
 `-Workspace` (launch from a git working copy), `-Run`/`-Editor`/`-AppBuilder`/

@@ -10,8 +10,11 @@ copy** with a rewritten PROPATH), scans database `.lg` logs for errors, checks
 broker ports, backs up your `conmgr`/`ubroker` properties before state changes,
 runs light **git** worktree maintenance plus everyday-git helpers for the git-shy
 (`-Git -UpdateRepos` / `-NewWorkspace` / `-GitStatus` / `-GitCommit` / `-GitPush` / `-GitHelp`), and can email a
-log/alert. It also has an interactive `-Menu` so operators don't have to memorize
-switches.
+log/alert. It also has a headless **application compiler** (`-Compile`, via the
+bundled `OECompiler.p`) and a **release bundler** (`-Package`) that packages one
+project's changed source plus its dependency-aware r-code into a versioned zip
+with a safe `deploy.ps1`. It also has an interactive `-Menu` so operators don't
+have to memorize switches.
 
 `-CopyBackup` runs on the **production** server and **pushes** backups to a named
 share on the dev server; large `.bk` files are binary-**split** into slices
@@ -201,6 +204,12 @@ shared components (NameServer / MSSQLBroker / OracleBroker) it actually runs.
 # ...skipping vendor sample code (ad-hoc patterns, or a standing compile-excludes.txt)
 ./OEAdmin.ps1 -Compile -App App1 -Site S1 -Env Test -Workspace my-feature-branch -Exclude "vendor\*,*sample*"
 ./OEAdmin.ps1 -Compile -App App1 -Site S1 -Env Test -Workspace my-feature-branch -ExcludeFile compile-excludes.txt
+
+# Package a release bundle (source + dependency-aware r-code + manifest + deploy.ps1)
+# Pass 1 - resolve + review the change set (commit-message search), no build yet
+./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace my-feature-branch -Grep "TICKET-123"
+# Pass 2 - accept the reviewed set (re-hashes; hard-stops on drift) and build the zip
+./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace my-feature-branch -Grep "TICKET-123" -Accept -Project TICKET-123
 
 # Fast-forward every mapped repo's worktrees (fetch + merge --ff-only), standalone
 ./OEAdmin.ps1 -Git -UpdateRepos

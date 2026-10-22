@@ -1,6 +1,6 @@
 <#PSScriptInfo
 
-.VERSION 1.0.0
+.VERSION 1.4.0
 
 .AUTHOR
 
@@ -72,6 +72,29 @@ You may obtain a copy of the License at
         <script dir>/batch/<program>/...; the -Compile driver's stdout/err go to
         <script dir>/batch/OECompiler/.  (compile.log/listing/xref still live under
         <sourceroot>/x/<stamp>/.)
+
+1.4.0 - Added -Package: a release bundler that packages the SOURCE changed for a
+        project plus its dependency-complete R-CODE and a manifest into a
+        versioned zip with a safe deploy.ps1.  The change set is resolved from the
+        -Workspace git worktree three ways (any mix): -Grep "<text>" (commit-
+        message search), -FromCommit <sha> [-ToCommit <sha>] (commit range),
+        and/or -FileList <file> (explicit path list); all normalized to app-root-
+        relative.  The ship set is dependency-aware: OECompiler XREF maps each
+        changed program to the includes/classes/procedures it pulls in, and the
+        R-CODE superset is shipped so a changed .i doesn't orphan a caller; -Full
+        ships r-code for the whole source tree instead.  The bundle is built from a
+        FRESH fail-closed compile against the REQUIRED -Site/-Env (r-code CRC is
+        tied to that schema), reusing the -Compile engine (inherits the standing
+        compile-excludes.txt when -ExcludeFile is blank).  Delta schema is carried
+        via -DeltaDf "<file,...>": the .df is bundled and deploy.ps1 PRINTS load
+        instructions for the DBA and awaits confirmation (it never shells
+        load_df.p); -DfLoadedConfirmed records that the DBA loaded it (separate from
+        -Accept; both cannot be set at once).  Two-pass gate: a first run resolves +
+        prints the change set for review; -Accept -Project <tok> re-hashes the
+        reviewed set and HARD-STOPS on any drift before compiling/zipping.
+        deploy.ps1 is dry-run by default (-Execute to apply), backs up each target
+        before overwrite, and has a -Rollback.  LOCAL worktree only (-Remote
+        refused).  -DryRun throughout.  Wired into -Menu.
 
 #>
 
@@ -183,6 +206,21 @@ ACTIONS:
                  (listing/) and -Xref/-XrefXml (xref/) per-file when set; the
                  driver's stdout/err go to <script dir>/batch/OECompiler/.  Any
                  COMPILER error is flagged loudly and sets the error exit.
+    -Package     Release bundler.  Resolves one project's change set from the
+                 -Workspace worktree (-Grep message search, -FromCommit/-ToCommit
+                 range, and/or -FileList - any mix), then ships the changed SOURCE
+                 plus its dependency-complete R-CODE (via OECompiler XREF; -Full
+                 ships the whole tree's r-code) and a manifest in a versioned zip
+                 with a safe deploy.ps1.  R-code is built by a FRESH fail-closed
+                 compile against the REQUIRED -Site/-Env (CRC tied to that schema).
+                 -DeltaDf "<file,...>" carries schema deltas: bundled, and the
+                 deploy script PRINTS load steps for the DBA (never auto-loads);
+                 -DfLoadedConfirmed records the DBA's load (separate from -Accept,
+                 mutually exclusive with it).  Two passes: run once to resolve +
+                 review the change set, then -Accept -Project <tok> re-hashes it and
+                 HARD-STOPS on drift before building.  deploy.ps1 is dry-run by
+                 default (-Execute to apply), backs up before overwrite, -Rollback
+                 restores.  LOCAL worktree only (-Remote refused).
 
 Backup / restore safety model:
     A server Tier (Production vs Development) is attached to every install.
@@ -256,6 +294,24 @@ Usage examples (all switches shown; App/Site/Env names are placeholders):
 
     # ...using the standing exclude file in the script folder (compile-excludes.txt)
     ./OEAdmin.ps1 -Compile -App App1 -Site S1 -Env Test -Workspace feature-x -ExcludeFile compile-excludes.txt
+
+    # Package (release bundler) - PASS 1: resolve + review the change set, no build
+    ./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace feature-x -Grep "TICKET-123"
+
+    # ...by commit range (and/or -FileList <file>) instead of a message search
+    ./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace feature-x -FromCommit abc1234 -ToCommit HEAD
+
+    # ...PASS 2: accept the reviewed set (re-hashes; hard-stops on drift), build zip
+    ./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace feature-x -Grep "TICKET-123" -Accept -Project TICKET-123
+
+    # ...carry a schema delta (deploy.ps1 prints DBA load steps + awaits them)
+    ./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace feature-x -Grep "TICKET-123" -Accept -Project TICKET-123 -DeltaDf "schema/delta.df"
+
+    # ...ship the WHOLE source tree's r-code (DB/CRC-wide change)
+    ./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace feature-x -Accept -Project FullRelease -Full
+
+    # ...preview the whole run (resolve + compile launch) without building
+    ./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace feature-x -Grep "TICKET-123" -Accept -Project TICKET-123 -DryRun
 
     # Status of ALL servers from one box, over the network (files + -host <server>)
     ./OEAdmin.ps1 -Remote
@@ -608,6 +664,44 @@ param (
     # own folder (a standing "compile-excludes.txt"); a path with a separator is
     # used verbatim.  Combined with -Exclude.  -Compile only.
     $ExcludeFile="",
+
+    ##### ---- PACKAGE (-Package) ----------------------------------------------
+    # -Package: build a versioned release bundle (zip) from ONE project's change
+    # set - the changed source, a dependency-aware set of freshly-compiled r-code,
+    # any schema delta .df files, a manifest, and a safe deploy.ps1 with rollback.
+    # Reuses the -Compile launch machinery; -Site AND -Env are REQUIRED (the r-code
+    # CRC is tied to the schema).  LOCAL git worktree only (-Remote refused).
+    [switch]$Package,
+
+    # -Project: project / ticket token - names the zip + manifest and keys the
+    # review file.  REQUIRED with -Accept.
+    $Project="",
+
+    # Change-set inputs (union; any mix, or -Full): -Grep searches commit messages
+    # (git log --grep); -FromCommit..-ToCommit is a commit range; -FileList is an
+    # explicit path-list file (one per line, '#' comments ok).
+    $Grep="",
+    $FromCommit="",
+    $ToCommit="",
+    $FileList="",
+
+    # -Accept: second pass - re-hash the reviewed change set (hard-stop on drift),
+    # compile fresh, and build the zip.  Without it, -Package only RESOLVES the set
+    # for review.  -Full ships the WHOLE source tree's r-code (DB/CRC-wide change).
+    [switch]$Accept,
+    [switch]$Full,
+
+    # -DeltaDf: schema-delta .df file(s) (comma list) to carry in the bundle; the
+    # generated deploy.ps1 PRINTS the DBA load steps and awaits them (never auto-
+    # loads).  -DfLoadedConfirmed non-interactively affirms the DF(s) are already
+    # loaded into the compile DB (so the r-code CRC can be trusted); it is SEPARATE
+    # from -Accept and the two confirmations are independent.
+    [string[]]$DeltaDf=@(),
+    [switch]$DfLoadedConfirmed,
+
+    # -PackageBackupDir: default PackageBackupDir baked into the generated
+    # deploy.ps1 (its backup-before-overwrite root).  Blank = the App1 backup dir.
+    $PackageBackupDir="",
 
     # The startup program appended by -Run (and the menu's "run startup?" prompt).
     # CHANGE THIS to your own startup .p if you use one.
@@ -2539,7 +2633,19 @@ function Get-CompileSourceRoot {
 # program exit (OECompiler QUITs 1 when any file had COMPILER errors) is surfaced
 # loudly and sets $script:OnError.
 function Do-Compile {
-    param($Item)
+    param(
+        $Item,
+        # Optional overrides so -Package can drive a fresh fail-closed compile with
+        # its own run dir / excludes and learn the result.  All default to the
+        # normal -Compile behavior, so a plain -Compile call is unchanged.
+        $OverrideXref       = $null,   # $true forces xref on (for the dependency map)
+        $OverrideMode       = $null,   # "full" / "incremental" (else -Incremental)
+        $OverrideRunDir     = $null,   # put the per-run tree here instead of <src>/x/<stamp>
+        $OverrideExcludeFile = $null,  # use this excludes file instead of -ExcludeFile
+        [switch]$ReturnInfo            # return a result object (RunDir/XrefDir/Errors/...)
+    )
+    # Hoisted so the -ReturnInfo block (after try/catch/finally) can read it.
+    $errCount = $null
     $L = Resolve-ClientLaunch -Item $Item -Tag "Compile"
     if (-not $L) { return }
 
@@ -2557,13 +2663,19 @@ function Do-Compile {
         $script:OnError = $true; return
     }
 
-    # Per-run output tree under <sourceroot>/x/<stamp>/.
+    # Per-run output tree under <sourceroot>/x/<stamp>/ (or the caller's dir).
     $stamp   = [DateTime]::Now.ToString("yyyy-MM-dd_HHmmss")
-    $runDir  = Join-PathX (Join-PathX $srcRoot "x") $stamp
+    $runDir  = if ($null -ne $OverrideRunDir -and "$OverrideRunDir" -ne "") { $OverrideRunDir } `
+               else { Join-PathX (Join-PathX $srcRoot "x") $stamp }
     $logFile = Join-PathX $runDir "compile.log"
     $listDir = Join-PathX $runDir "listing"
     $xrefDir = Join-PathX $runDir "xref"
-    $mode    = if ($Incremental -eq $true) { "incremental" } else { "full" }
+    $mode    = if ($null -ne $OverrideMode -and "$OverrideMode" -ne "") { $OverrideMode } `
+               elseif ($Incremental -eq $true) { "incremental" } else { "full" }
+    # -Package forces xref on (it needs the dependency map) regardless of -Xref.
+    $xrefOn  = ($Xref -eq $true) -or ($OverrideXref -eq $true)
+    # -Package passes its own excludes file; otherwise honor -ExcludeFile.
+    $effExcludeFile = if ($null -ne $OverrideExcludeFile) { $OverrideExcludeFile } else { $ExcludeFile }
 
     # Build the merged EXCLUDE pattern list from -Exclude (comma lists / array) and
     # -ExcludeFile (one pattern per line; '#' comments + blanks ignored).  A bare
@@ -2577,8 +2689,8 @@ function Do-Compile {
             if (-not [string]::IsNullOrWhiteSpace($one)) { $exPatterns.Add($one) }
         }
     }
-    if (-not [string]::IsNullOrWhiteSpace($ExcludeFile)) {
-        $exPath = if ($ExcludeFile -match '[\\/]') { $ExcludeFile } else { Join-PathX $PSScriptRoot $ExcludeFile }
+    if (-not [string]::IsNullOrWhiteSpace($effExcludeFile)) {
+        $exPath = if ($effExcludeFile -match '[\\/]') { $effExcludeFile } else { Join-PathX $PSScriptRoot $effExcludeFile }
         if (Test-Path -Path $exPath -PathType Leaf) {
             foreach ($ln in (Get-Content -Path $exPath)) {
                 $ln = $ln.Trim()
@@ -2616,7 +2728,7 @@ function Do-Compile {
         "logfile = $logFile",
         ("listing = " + $(if ($Listing -eq $true) { "yes" } else { "no" })),
         "listingdir = $listDir",
-        ("xref = " + $(if ($Xref -eq $true) { "yes" } else { "no" })),
+        ("xref = " + $(if ($xrefOn) { "yes" } else { "no" })),
         "xrefdir = $xrefDir",
         ("xrefxml = " + $(if ($XrefXml -eq $true) { "yes" } else { "no" })),
         "statusfile = $statusFile"
@@ -2647,7 +2759,7 @@ function Do-Compile {
     try {
         $null = New-Item -ItemType Directory -Path $runDir -Force -ErrorAction Stop
         if ($Listing -eq $true) { $null = New-Item -ItemType Directory -Path $listDir -Force -ErrorAction Stop }
-        if ($Xref    -eq $true) { $null = New-Item -ItemType Directory -Path $xrefDir -Force -ErrorAction Stop }
+        if ($xrefOn)            { $null = New-Item -ItemType Directory -Path $xrefDir -Force -ErrorAction Stop }
         Set-Content -Path $paramFile -Value $pfLines -Encoding ascii -ErrorAction Stop
     } catch {
         Write-Message ("  Compile: could not create output dir / param file: {0}" -f $_.Exception.Message) -Fore Red
@@ -2670,6 +2782,7 @@ function Do-Compile {
         # is the authoritative pass/fail signal.
         $errCount = -1
         if (Test-Path -Path $statusFile -PathType Leaf) {
+            # (errCount is function-scoped; set here so -ReturnInfo can read it)
             $m = (Get-Content -Path $statusFile -ErrorAction SilentlyContinue | Select-String -Pattern 'ERRORS=(-?\d+)')
             if ($m) { $errCount = [int]$m.Matches[0].Groups[1].Value }
         }
@@ -2695,6 +2808,790 @@ function Do-Compile {
         $env:DLC = $prev
         Remove-Item -Path $paramFile -Force -ErrorAction SilentlyContinue
     }
+
+    # -Package calls with -ReturnInfo to learn where the artifacts are and whether
+    # the compile was clean.  Errors: $null=never ran, -1=setup/abort, 0=clean,
+    # >0=that many files errored.  Callers treat $null/-1/>0 all as "do not ship".
+    if ($ReturnInfo) {
+        return [PSCustomObject]@{ RunDir=$runDir; XrefDir=$xrefDir; LogFile=$logFile;
+                                  StatusFile=$statusFile; Errors=$errCount; DryRun=$false; SourceRoot=$srcRoot }
+    }
+}
+
+## ============================================================================
+## PACKAGE  (-Package : build a release bundle from one project's change set)
+## ============================================================================
+# -Package turns ONE project's change set into a versioned, auditable release
+# bundle (a zip): the CHANGED source, a dependency-aware set of freshly-compiled
+# r-code, any schema delta .df files, a manifest (JSON + text), and a safe self-
+# deploying deploy.ps1 with rollback.  It reuses the -Compile / -Batch launch
+# machinery verbatim (Resolve-ClientLaunch / Get-CompileSourceRoot / Do-Compile /
+# OECompiler.p); the only existing-code change is Do-Compile's backward-compatible
+# override params above.  -Site AND -Env are REQUIRED (the r-code CRC is tied to
+# the schema it compiles against).  LOCAL git worktree only (-Remote refused).
+#
+# Two gated passes:
+#   RESOLVE (no -Accept): union the change-set inputs, cross-check any inline
+#     change markers (advisory), write a human-reviewable change-set file carrying
+#     a hash of the reviewed set, and STOP.
+#   ACCEPT (-Accept, which REQUIRES -Project): re-resolve, refuse unless the fresh
+#     set matches the reviewed hash, run ONE full xref-on fresh compile against
+#     -Site/-Env (fail-closed, inheriting the standing compile excludes), compute
+#     the dependency-aware ship set from the xref, confirm delta DFs are loaded
+#     (a gate distinct from -Accept), then assemble + zip the bundle.
+# -DryRun previews every pass without writing the zip.
+
+# Slugify a project/tag token into a filename-safe string.
+function Get-PackageSlug {
+    param($Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return "" }
+    $s = ($Value -replace '[\\/:*?"<>|]', ' ').Trim()
+    $s = ($s -replace '\s+', '-')
+    return $s
+}
+
+# Resolve the git repo root for $srcRoot and the "app segment" (the relative path
+# from the repo root down to $srcRoot), forward-slashed.  git reports repo-relative
+# paths WITH this segment; we strip it to get the app-root-relative base used
+# everywhere (source/, rcode/, manifest, deploy.ps1).  Returns $null (and writes a
+# reason) if $srcRoot is not inside a local git worktree.
+function Get-PackageRepoInfo {
+    param($SrcRoot)
+    $top = & git -C $SrcRoot rev-parse --show-toplevel 2>&1
+    if ($LASTEXITCODE -ne 0 -or -not $top) {
+        Write-Message ("  Package: '{0}' is not inside a git worktree ({1}). -Package must run against a LOCAL git worktree." -f $SrcRoot, ($top -join ' ').Trim()) -Fore Red
+        return $null
+    }
+    $repoRoot = ("$top".Trim() -replace '\\', '/').TrimEnd('/')
+    $src      = ($SrcRoot -replace '\\', '/').TrimEnd('/')
+    $appSeg   = ""
+    if ($src.ToLower().StartsWith($repoRoot.ToLower()) -and $src.Length -gt $repoRoot.Length) {
+        $appSeg = $src.Substring($repoRoot.Length).Trim('/')
+    }
+    return [PSCustomObject]@{ RepoRoot=$repoRoot; AppSegment=$appSeg }
+}
+
+# Convert a git repo-relative path (e.g. "App1/Bin/prog.p") to app-root-relative
+# (e.g. "Bin/prog.p") by stripping the leading app segment.  Forward-slashed.
+function ConvertTo-AppRootRelative {
+    param($RepoRelPath, $AppSegment)
+    $p = ($RepoRelPath -replace '\\', '/').Trim('/')
+    if ($AppSegment -ne "" -and $p.ToLower().StartsWith(($AppSegment.ToLower() + '/'))) {
+        $p = $p.Substring($AppSegment.Length + 1)
+    } elseif ($AppSegment -ne "" -and $p.ToLower() -eq $AppSegment.ToLower()) {
+        $p = ""
+    }
+    return $p
+}
+
+# Resolve the change set: union -Grep / -FromCommit..-ToCommit / -FileList, all
+# normalized to app-root-relative paths.  Also returns the change-set git commit
+# hashes for the manifest.  Writes a reason + returns $null on a hard error.
+function Resolve-PackageChangeSet {
+    param($SrcRoot, $AppSegment)
+    $files   = New-Object System.Collections.Generic.List[string]
+    $commits = New-Object System.Collections.Generic.List[string]
+    $used    = $false
+
+    # Input 1: -Grep tag -> git log --grep (its commits ARE the change-set commits).
+    if (-not [string]::IsNullOrWhiteSpace($Grep)) {
+        $used = $true
+        $raw = & git -C $SrcRoot log -i --grep $Grep --name-only --pretty=format:"__COMMIT__%H" 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Message ("  Package: git log --grep failed: {0}" -f ($raw -join ' ').Trim()) -Fore Red
+            return $null
+        }
+        foreach ($ln in $raw) {
+            $t = "$ln".Trim()
+            if ($t -eq "") { continue }
+            if ($t.StartsWith("__COMMIT__")) { $commits.Add($t.Substring(10)); continue }
+            $files.Add((ConvertTo-AppRootRelative -RepoRelPath $t -AppSegment $AppSegment))
+        }
+    }
+
+    # Input 2: -FromCommit..-ToCommit range (both required together).
+    $haveFrom = -not [string]::IsNullOrWhiteSpace($FromCommit)
+    $haveTo   = -not [string]::IsNullOrWhiteSpace($ToCommit)
+    if ($haveFrom -ne $haveTo) {
+        Write-Message "  Package: both -FromCommit and -ToCommit are required together." -Fore Red
+        return $null
+    }
+    if ($haveFrom -and $haveTo) {
+        $used = $true
+        $raw = & git -C $SrcRoot diff --name-only ("{0}..{1}" -f $FromCommit, $ToCommit) 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Message ("  Package: git diff {0}..{1} failed: {2}" -f $FromCommit, $ToCommit, ($raw -join ' ').Trim()) -Fore Red
+            return $null
+        }
+        foreach ($ln in $raw) { $t = "$ln".Trim(); if ($t -ne "") { $files.Add((ConvertTo-AppRootRelative -RepoRelPath $t -AppSegment $AppSegment)) } }
+        $rc = & git -C $SrcRoot log --pretty=format:"%H" ("{0}..{1}" -f $FromCommit, $ToCommit) 2>&1
+        if ($LASTEXITCODE -eq 0) { foreach ($h in $rc) { $t = "$h".Trim(); if ($t -ne "") { $commits.Add($t) } } }
+    }
+
+    # Input 3: -FileList explicit list.
+    if (-not [string]::IsNullOrWhiteSpace($FileList)) {
+        $used = $true
+        $flPath = if ($FileList -match '[\\/]') { $FileList } else { Join-PathX $SrcRoot $FileList }
+        if (-not (Test-Path -Path $flPath -PathType Leaf)) {
+            Write-Message ("  Package: -FileList not found: {0}" -f $flPath) -Fore Red
+            return $null
+        }
+        foreach ($ln in (Get-Content -Path $flPath)) {
+            $t = "$ln".Trim()
+            if ($t -eq "" -or $t.StartsWith('#')) { continue }
+            # A -FileList entry may be absolute, $srcRoot-relative, or repo-relative;
+            # normalize to app-root-relative.  If it is already app-root-relative it
+            # passes through ConvertTo-AppRootRelative unchanged (no app segment prefix).
+            $t = $t -replace '\\', '/'
+            if ([System.IO.Path]::IsPathRooted($t)) {
+                $full = ($t -replace '\\','/'); $srcN = ($SrcRoot -replace '\\','/').TrimEnd('/')
+                if ($full.ToLower().StartsWith($srcN.ToLower() + '/')) { $t = $full.Substring($srcN.Length + 1) }
+            } else {
+                $t = ConvertTo-AppRootRelative -RepoRelPath $t -AppSegment $AppSegment
+            }
+            $files.Add($t)
+        }
+    }
+
+    if (-not $used) {
+        Write-Message "  Package: needs a change-set input (-Grep / -FromCommit+-ToCommit / -FileList) or -Full." -Fore Red
+        return $null
+    }
+
+    # De-dup (case-insensitive), drop blanks, sort for a stable review + hash.
+    $seen = @{}
+    $out  = New-Object System.Collections.Generic.List[string]
+    foreach ($f in $files) {
+        if ([string]::IsNullOrWhiteSpace($f)) { continue }
+        $k = $f.ToLower()
+        if (-not $seen.ContainsKey($k)) { $seen[$k] = $true; $out.Add($f) }
+    }
+    $sorted = @($out | Sort-Object)
+    $cseen = @{}; $cout = New-Object System.Collections.Generic.List[string]
+    foreach ($c in $commits) { if ($c -ne "" -and -not $cseen.ContainsKey($c)) { $cseen[$c]=$true; $cout.Add($c) } }
+    return [PSCustomObject]@{ Files=$sorted; Commits=@($cout) }
+}
+
+# SHA-256 of the sorted, lowercased, newline-joined change-set paths (order-
+# independent); drives the -Accept reviewed-set gate.
+function Get-ChangeSetHash {
+    param([string[]]$Files)
+    $norm = (@($Files | ForEach-Object { $_.ToLower() } | Sort-Object) -join "`n")
+    $sha  = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($norm)
+        return (($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString("x2") }) -join "")
+    } finally { $sha.Dispose() }
+}
+
+# Advisory marker cross-check: warn on drift between git-reported files and files
+# carrying an inline change marker (/* XX YYYY-MM-DD ... changes */).  NEVER blocks.
+# Also returns the matched marker text per file (for the manifest revisionHistory).
+function Test-PackageMarkers {
+    param($SrcRoot, [string[]]$Files)
+    $markerRx = '/\*\s*[A-Za-z]{2,4}\s+\d{4}-\d{2}-\d{2}\b.*changes\b.*\*/'
+    $markerNoGit = New-Object System.Collections.Generic.List[string]
+    $gitNoMarker = New-Object System.Collections.Generic.List[string]
+    $markerText  = @{}
+    # 1) each git-reported file: does it carry a marker?
+    foreach ($f in $Files) {
+        $full = Join-PathX $SrcRoot ($f -replace '/', '\')
+        if (-not (Test-Path -Path $full -PathType Leaf)) { continue }
+        $hit = Select-String -Path $full -Pattern $markerRx -AllMatches -ErrorAction SilentlyContinue
+        if ($hit) { $markerText[$f] = @($hit.Matches | ForEach-Object { $_.Value.Trim() }) }
+        else      { $gitNoMarker.Add($f) }
+    }
+    # 2) files in the tree carrying a marker git did NOT report (bounded to source).
+    $gitLower = @{}; foreach ($f in $Files) { $gitLower[$f.ToLower()] = $true }
+    $scan = Get-ChildItem -Path $SrcRoot -Recurse -File -Include *.p,*.w,*.cls,*.i,*.t -ErrorAction SilentlyContinue
+    foreach ($fi in $scan) {
+        $hit = Select-String -Path $fi.FullName -Pattern $markerRx -ErrorAction SilentlyContinue
+        if (-not $hit) { continue }
+        $rel = ($fi.FullName -replace '\\','/')
+        $srcN = ($SrcRoot -replace '\\','/').TrimEnd('/')
+        if ($rel.ToLower().StartsWith($srcN.ToLower() + '/')) { $rel = $rel.Substring($srcN.Length + 1) }
+        if (-not $gitLower.ContainsKey($rel.ToLower())) { $markerNoGit.Add($rel) }
+    }
+    return [PSCustomObject]@{ MarkerNoGit=@($markerNoGit); GitNoMarker=@($gitNoMarker); MarkerText=$markerText }
+}
+
+# Parse the XREF tree (one .xref per compile unit) into an include->units map and
+# the set of all compile units, both keyed app-root-relative.  Two signals:
+#  (a) column-2 referenced-file full paths (captures includes that emit code);
+#  (b) INCLUDE reference-type rows (captures define-only / preprocessor-only
+#      includes whose path appears ONLY in the INCLUDE detail), filtered so
+#      {&named-arg} refs ("get"/"set"/"fn"...) are discarded.
+function Get-PackageDependencyMap {
+    param($XrefDir, $SrcRoot, $AppSegment)
+    $srcN = ($SrcRoot -replace '\\','/').TrimEnd('/')
+    # include(app-rel) -> hashset of compile-unit(app-rel)
+    $inv   = @{}
+    $units = @{}   # app-rel compile unit -> $true
+
+    $toAppRel = {
+        param($full)
+        $p = ("$full" -replace '\\','/')
+        if ($p.ToLower().StartsWith($srcN.ToLower() + '/')) { return $p.Substring($srcN.Length + 1) }
+        return $p   # out-of-tree (vendor DLC includes) kept verbatim; never matches a changed file
+    }
+    $addDep = {
+        param($unitRel, $depRel)
+        if (-not $inv.ContainsKey($depRel)) { $inv[$depRel] = @{} }
+        $inv[$depRel][$unitRel] = $true
+    }
+
+    $xrefFiles = Get-ChildItem -Path $XrefDir -Recurse -File -Filter *.xref -ErrorAction SilentlyContinue
+    foreach ($xf in $xrefFiles) {
+        # The owning compile unit is THIS .xref's source (authoritative), derived
+        # from the xref's mirrored path: <XrefDir>/<app-rel>.xref  ->  <app-rel>.
+        $xrel = ($xf.FullName -replace '\\','/')
+        $xdirN = ($XrefDir -replace '\\','/').TrimEnd('/')
+        $unitRel = $xrel
+        if ($xrel.ToLower().StartsWith($xdirN.ToLower() + '/')) { $unitRel = $xrel.Substring($xdirN.Length + 1) }
+        $unitRel = $unitRel -replace '\.xref$', ''
+        $units[$unitRel] = $true
+        $addDep.Invoke($unitRel, $unitRel) | Out-Null   # a unit depends on itself
+
+        foreach ($line in (Get-Content -Path $xf.FullName -ErrorAction SilentlyContinue)) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            # Signal (a): column-2 referenced-file full path.  Tokenize honoring a
+            # possible quoted path; we only need token[1] and the ref-type token[3].
+            $toks = $line -split '\s+'
+            if ($toks.Count -ge 2) {
+                $ref = $toks[1]
+                if ($ref -match '^[A-Za-z]:[\\/]' -or $ref -match '^[\\/]') {
+                    $depRel = $toAppRel.Invoke($ref)
+                    $addDep.Invoke($unitRel, $depRel) | Out-Null
+                }
+            }
+            # Signal (b): INCLUDE rows.  Find the INCLUDE ref-type and the detail.
+            $m = [regex]::Match($line, '\bINCLUDE\b\s+(.*)$')
+            if ($m.Success) {
+                $detail = $m.Groups[1].Value.Trim()
+                $inc = ""
+                if ($detail.StartsWith('"')) {
+                    # quoted (include has args): first ws-item inside the quotes
+                    $inner = $detail.Substring(1)
+                    $inner = $inner -replace '".*$', ''        # drop at the closing quote region
+                    $inc = (($inner -split '\s+') | Where-Object { $_ -ne "" } | Select-Object -First 1)
+                } else {
+                    $inc = (($detail -split '\s+') | Where-Object { $_ -ne "" } | Select-Object -First 1)
+                }
+                if ($inc) {
+                    $inc = $inc.Trim('"')
+                    # Filter {&named-arg} refs: keep only real include/source names
+                    # (known extension) or tokens that resolve to a real file.
+                    $isFileName = ($inc -match '\.(i|p|w|cls|t)$')
+                    $resolved = ""
+                    if ($isFileName) {
+                        $unitDir = Split-Path (Join-PathX $SrcRoot ($unitRel -replace '/','\')) -Parent
+                        foreach ($cand in @((Join-PathX $unitDir ($inc -replace '/','\')), (Join-PathX $SrcRoot ($inc -replace '/','\')))) {
+                            if (Test-Path -Path $cand -PathType Leaf) { $resolved = ($cand -replace '\\','/'); break }
+                        }
+                        $depRel = if ($resolved -ne "") { $toAppRel.Invoke($resolved) } else { ($inc -replace '\\','/') }
+                        $addDep.Invoke($unitRel, $depRel) | Out-Null
+                    }
+                    # not a filename-looking token -> {&name} arg ref, discard.
+                }
+            }
+        }
+    }
+    return [PSCustomObject]@{ Inverted=$inv; Units=$units }
+}
+
+# Build the r-code ship set (app-rel compile-unit paths) from the dependency map
+# and the changed files: every unit that references/includes a changed file, plus
+# every changed file that is itself a compile unit (.p .w .cls .t).
+function Get-PackageRcodeSet {
+    param($DepMap, [string[]]$ChangedFiles)
+    $ship = @{}
+    foreach ($f in $ChangedFiles) {
+        $fl = $f.ToLower()
+        # changed file that is itself a compile unit
+        if ($f -match '\.(p|w|cls|t)$' -and $DepMap.Units.ContainsKey($f)) { $ship[$f] = $true }
+        elseif ($f -match '\.(p|w|cls|t)$') {
+            # a compile unit present in the tree even if the xref key cased differently
+            foreach ($u in $DepMap.Units.Keys) { if ($u.ToLower() -eq $fl) { $ship[$u] = $true } }
+        }
+        # every unit that depends on this changed file (include or direct)
+        foreach ($depKey in $DepMap.Inverted.Keys) {
+            if ($depKey.ToLower() -eq $fl) {
+                foreach ($u in $DepMap.Inverted[$depKey].Keys) { $ship[$u] = $true }
+            }
+        }
+    }
+    return @($ship.Keys | Sort-Object)
+}
+
+# Extract header "Revisions:" block lines + inline markers from a changed file
+# (best-effort; missing block -> empty).
+function Get-PackageRevisionLines {
+    param($FullPath, [string[]]$MarkerHits)
+    $lines = New-Object System.Collections.Generic.List[string]
+    if (Test-Path -Path $FullPath -PathType Leaf) {
+        $inRev = $false; $n = 0
+        foreach ($ln in (Get-Content -Path $FullPath -ErrorAction SilentlyContinue)) {
+            $n++
+            if ($n -gt 120) { break }   # header block only
+            if ($ln -match '(?i)revisions\s*:') { $inRev = $true; continue }
+            if ($inRev) {
+                if ($ln -match '\*/' -or [string]::IsNullOrWhiteSpace(($ln -replace '[\*\s]',''))) { $inRev = $false; continue }
+                $t = $ln.Trim(); if ($t -ne "") { $lines.Add($t) }
+            }
+        }
+    }
+    foreach ($mk in @($MarkerHits)) { if ($mk) { $lines.Add("[marker] " + $mk) } }
+    return @($lines)
+}
+
+# The -Package action for one resolved environment target.
+function Do-Package {
+    param($Item)
+
+    $L = Resolve-ClientLaunch -Item $Item -Tag "Package"
+    if (-not $L) { return }
+
+    # -Package is a LOCAL build action: -Remote source roots are UNC and not git
+    # worktrees, so refuse early with a clear message.
+    if ($Remote -eq $true) {
+        Write-Message "  Package: -Remote is not supported; -Package must run against a LOCAL git worktree." -Fore Red
+        $script:OnError = $true; return
+    }
+
+    $srcRoot = Get-CompileSourceRoot -Item $Item
+    if (-not $srcRoot) {
+        Write-Message ("  Package: could not resolve a source root for {0}" -f $Item.Name) -Fore Red
+        $script:OnError = $true; return
+    }
+
+    # -Accept requires -Project (the stable review file is keyed by project).
+    if ($Accept -eq $true -and [string]::IsNullOrWhiteSpace($Project)) {
+        Write-Message "  Package: -Accept requires -Project <token> (the review file is keyed by project)." -Fore Red
+        $script:OnError = $true; return
+    }
+    # Require a change-set input unless -Full.
+    $haveInput = (-not [string]::IsNullOrWhiteSpace($Grep)) -or
+                 (-not [string]::IsNullOrWhiteSpace($FromCommit)) -or
+                 (-not [string]::IsNullOrWhiteSpace($ToCommit))  -or
+                 (-not [string]::IsNullOrWhiteSpace($FileList))
+    if (-not $haveInput -and $Full -ne $true) {
+        Write-Message "  Package: needs a change-set input (-Grep / -FromCommit+-ToCommit / -FileList) or -Full." -Fore Red
+        $script:OnError = $true; return
+    }
+
+    $repoInfo = Get-PackageRepoInfo -SrcRoot $srcRoot
+    if (-not $repoInfo) { $script:OnError = $true; return }
+    $appSeg = $repoInfo.AppSegment
+
+    $stamp   = [DateTime]::Now.ToString("yyyy-MM-dd_HHmmss")
+    $projTok = Get-PackageSlug -Value $Project
+    if ($projTok -eq "") { $projTok = Get-PackageSlug -Value $Grep }
+    if ($projTok -eq "") { $projTok = "package" }
+
+    $pkgRoot    = Join-PathX $PSScriptRoot "packages"
+    $reviewFile = Join-PathX $pkgRoot ("{0}.changeset.txt" -f $projTok)        # stable, keyed by project
+    $stampedRev = Join-PathX $pkgRoot ("{0}_{1}.changeset.txt" -f $projTok, $stamp)
+    $staging    = Join-PathX $pkgRoot ("{0}_{1}" -f $projTok, $stamp)
+    $zipPath    = Join-PathX $pkgRoot ("{0}_{1}.zip" -f $projTok, $stamp)
+
+    Write-Message ("Package: {0,-38} {1}  [{2}]" -f (& $Label $Item), $L.ExeName, $(if ($Full -eq $true){"full"}else{"changes"})) -Fore Cyan
+    Write-Message ("  source root : {0}   (repo {1}, app segment '{2}')" -f $srcRoot, $repoInfo.RepoRoot, $appSeg) -Fore DarkGray
+    Write-Message ("  project     : {0}" -f $projTok) -Fore DarkGray
+
+    # ---- Resolve the change set (unless -Full with no inputs) ----------------
+    $changed = @()
+    $csCommits = @()
+    if ($haveInput) {
+        $cs = Resolve-PackageChangeSet -SrcRoot $srcRoot -AppSegment $appSeg
+        if (-not $cs) { $script:OnError = $true; return }
+        $changed = @($cs.Files)
+        $csCommits = @($cs.Commits)
+        if ($changed.Count -eq 0) {
+            Write-Message "  Package: no files resolved from the change-set inputs." -Fore Red
+            $script:OnError = $true; return
+        }
+    }
+
+    # ---- Advisory marker cross-check -----------------------------------------
+    $markers = $null
+    if ($changed.Count -gt 0) {
+        $markers = Test-PackageMarkers -SrcRoot $srcRoot -Files $changed
+        foreach ($f in @($markers.MarkerNoGit)) { Write-Message ("  WARN: marker present but git did not report: {0}" -f $f) -Fore Yellow }
+        foreach ($f in @($markers.GitNoMarker)) { Write-Message ("  WARN: git reported but no inline marker found: {0}" -f $f) -Fore Yellow }
+    }
+
+    # ---- Reviewed-set hash ----------------------------------------------------
+    $setHash = if ($changed.Count -gt 0) { Get-ChangeSetHash -Files $changed } else { "FULL-NO-CHANGESET" }
+
+    if (-not (Test-Path -Path $pkgRoot)) {
+        if ($DryRun -ne $true) { $null = New-Item -ItemType Directory -Path $pkgRoot -Force -ErrorAction SilentlyContinue }
+    }
+
+    # Compose the review-file content.
+    $revHeader = @(
+        "# OEAdmin -Package change set for review",
+        "# project   : $projTok",
+        "# stamp     : $stamp",
+        "# target    : $($Item.App) / $($Item.Site) / $($Item.Env)  (server $($Item.Server))",
+        "# source    : $srcRoot",
+        "# appSegment: $appSeg",
+        "# inputs    : Grep='$Grep' FromCommit='$FromCommit' ToCommit='$ToCommit' FileList='$FileList' Full=$Full",
+        "# drift     : markerNoGit=$(@($markers.MarkerNoGit).Count) gitNoMarker=$(@($markers.GitNoMarker).Count)",
+        "# SETHASH=$setHash",
+        "#",
+        "# One app-root-relative path per line.  Review, then re-run with -Accept."
+    ) + @($changed)
+
+    # ---- Gate logic -----------------------------------------------------------
+    if ($Accept -ne $true) {
+        # RESOLVE pass: write the review files and STOP (no compile, no zip).
+        if ($DryRun -ne $true) {
+            Set-Content -Path $reviewFile -Value $revHeader -Encoding ascii
+            Set-Content -Path $stampedRev -Value $revHeader -Encoding ascii
+        }
+        Write-Message ("  Resolved {0} changed source file(s):" -f $changed.Count) -Fore Green
+        foreach ($f in $changed) { Write-Message ("    {0}" -f $f) -Fore Gray }
+        if ($DryRun -eq $true) {
+            Write-Message "  [DRYRUN] resolve pass - no review file written." -Fore DarkGray
+        } else {
+            Write-Message ("  Review file: {0}" -f $reviewFile) -Fore DarkGray
+        }
+        Write-Message  "  To build the bundle, review the list then re-run with -Accept:" -Fore Cyan
+        Write-Message ("    .\OEAdmin.ps1 -Package -App {0} -Site {1} -Env {2} -Project {3} ... -Accept" -f $Item.App, $Item.Site, $Item.Env, $projTok) -Fore Cyan
+        return
+    }
+
+    # ACCEPT pass: the reviewed set must match the stable review file's hash.
+    if (-not (Test-Path -Path $reviewFile -PathType Leaf)) {
+        Write-Message ("  Package: no reviewed change set found ({0}). Re-run WITHOUT -Accept to produce a review, confirm it, then -Accept." -f $reviewFile) -Fore Red
+        $script:OnError = $true; return
+    }
+    $reviewedHash = ""
+    $rh = Select-String -Path $reviewFile -Pattern 'SETHASH=([0-9a-fA-F]+)' -ErrorAction SilentlyContinue
+    if ($rh) { $reviewedHash = $rh.Matches[0].Groups[1].Value }
+    if ($reviewedHash -ne $setHash) {
+        Write-Message "  Package: the change set has changed since review (hash mismatch)." -Fore Red
+        Write-Message "    Re-run WITHOUT -Accept to produce a fresh review, confirm it, then re-run with -Accept." -Fore Red
+        $script:OnError = $true; return
+    }
+
+    # ---- Delta-DF confirmation gate (distinct from -Accept) -------------------
+    $dfFiles = @()
+    foreach ($entry in @($DeltaDf)) {
+        foreach ($one in ($entry -split ',')) {
+            $one = $one.Trim()
+            if ([string]::IsNullOrWhiteSpace($one)) { continue }
+            $dfPath = if ($one -match '[\\/]') { $one } else { Join-PathX $srcRoot $one }
+            if (-not (Test-Path -Path $dfPath -PathType Leaf)) {
+                Write-Message ("  Package: -DeltaDf file not found: {0}" -f $dfPath) -Fore Red
+                $script:OnError = $true; return
+            }
+            if ($one -notmatch '\.df$') { Write-Message ("  Package: -DeltaDf '{0}' is not a .df file (continuing)." -f $one) -Fore Yellow }
+            $dfFiles += $dfPath
+        }
+    }
+    if ($dfFiles.Count -gt 0) {
+        if ($DryRun -eq $true) {
+            Write-Message ("  [DRYRUN] delta-DF gate WOULD require confirmation the {0} DF(s) are loaded into {1}/{2}/{3} (-DfLoadedConfirmed or interactive yes)." -f $dfFiles.Count, $Item.App, $Item.Site, $Item.Env) -Fore DarkGray
+        } else {
+            $confirmed = $false
+            if ($DfLoadedConfirmed -eq $true) { $confirmed = $true }
+            elseif ([Environment]::UserInteractive) {
+                $confirmed = Read-YesNo -Prompt ("Delta DF(s) [{0}] - confirm these are ALREADY LOADED into {1}/{2}/{3} before trusting the compiled r-code?" -f (($dfFiles | ForEach-Object { Split-Path $_ -Leaf }) -join ', '), $Item.App, $Item.Site, $Item.Env) -Default:$false
+            }
+            if (-not $confirmed) {
+                Write-Message "  Package: delta-DF load not confirmed. Pass -DfLoadedConfirmed (non-interactive) or answer yes. Aborting." -Fore Red
+                $script:OnError = $true; return
+            }
+        }
+    }
+
+    # ---- Fresh fail-closed compile (xref on, full) ----------------------------
+    # Inherit the SAME excludes as -Compile, defaulting to the standing
+    # compile-excludes.txt whenever -ExcludeFile is blank (independent of -Exclude),
+    # so the full-root compile does not fail closed on vendor sample code.
+    $effExcludeFile = if ([string]::IsNullOrWhiteSpace($ExcludeFile)) { "compile-excludes.txt" } else { $ExcludeFile }
+    $pkgRunDir = Join-PathX $staging "compile"
+    Write-Message "  Running fresh fail-closed compile (xref on, full)..." -Fore Cyan
+    if ($DryRun -eq $true) {
+        Write-Message ("  [DRYRUN] would compile source root {0} against {1}/{2}/{3}, excludes file '{4}'." -f $srcRoot, $Item.App, $Item.Site, $Item.Env, $effExcludeFile) -Fore DarkGray
+    }
+    $ci = Do-Compile -Item $Item -OverrideXref $true -OverrideMode "full" `
+                     -OverrideRunDir $pkgRunDir -OverrideExcludeFile $effExcludeFile -ReturnInfo
+
+    if ($DryRun -ne $true) {
+        if ($null -eq $ci -or $null -eq $ci.Errors -or $ci.Errors -ne 0) {
+            $ec = if ($null -eq $ci) { "(compile did not run)" } else { $ci.Errors }
+            Write-Message ("  Package: fresh compile did not complete clean (errors={0}). Bundle aborted." -f $ec) -Fore Red
+            if ($ci -and $ci.LogFile) { Write-Message ("    log: {0}" -f $ci.LogFile) -Fore Red }
+            Remove-Item -Path $staging -Recurse -Force -ErrorAction SilentlyContinue
+            $script:OnError = $true; return
+        }
+    }
+
+    # ---- Dependency-aware r-code ship set -------------------------------------
+    $rcodeSet = @()
+    if ($Full -eq $true) {
+        # ship every .r produced beside source under $srcRoot
+        $rItems = Get-ChildItem -Path $srcRoot -Recurse -File -Filter *.r -ErrorAction SilentlyContinue
+        $srcN = ($srcRoot -replace '\\','/').TrimEnd('/')
+        foreach ($ri in $rItems) {
+            $rel = ($ri.FullName -replace '\\','/')
+            if ($rel.ToLower().StartsWith($srcN.ToLower() + '/')) { $rcodeSet += $rel.Substring($srcN.Length + 1) -replace '\.r$','' }
+        }
+        $rcodeSet = @($rcodeSet | Sort-Object)
+    } elseif ($DryRun -ne $true) {
+        $depMap = Get-PackageDependencyMap -XrefDir $ci.XrefDir -SrcRoot $srcRoot -AppSegment $appSeg
+        if ($depMap.Units.Count -eq 0) {
+            Write-Message "  Package: XREF scan produced no compile units; aborting (fail closed)." -Fore Red
+            Remove-Item -Path $staging -Recurse -Force -ErrorAction SilentlyContinue
+            $script:OnError = $true; return
+        }
+        $rcodeSet = @(Get-PackageRcodeSet -DepMap $depMap -ChangedFiles $changed)
+    }
+
+    # ---- Assemble the bundle --------------------------------------------------
+    if ($DryRun -eq $true) {
+        Write-Message ("  [DRYRUN] would ship {0} changed source file(s) and {1} r-code unit(s):" -f $changed.Count, $rcodeSet.Count) -Fore DarkGray
+        foreach ($f in $changed)  { Write-Message ("    source  {0}" -f $f) -Fore DarkGray }
+        foreach ($u in $rcodeSet) { Write-Message ("    rcode   {0}.r" -f $u) -Fore DarkGray }
+        foreach ($d in $dfFiles)  { Write-Message ("    df      {0}" -f (Split-Path $d -Leaf)) -Fore DarkGray }
+        Write-Message ("  [DRYRUN] would write: {0}" -f $zipPath) -Fore DarkGray
+        Remove-Item -Path $staging -Recurse -Force -ErrorAction SilentlyContinue
+        return
+    }
+
+    $srcStage = Join-PathX $staging "source"
+    $rStage   = Join-PathX $staging "rcode"
+    $dfStage  = Join-PathX $staging "df"
+    foreach ($d in @($srcStage, $rStage, $dfStage)) { $null = New-Item -ItemType Directory -Path $d -Force -ErrorAction SilentlyContinue }
+
+    $changedManifest = New-Object System.Collections.Generic.List[object]
+    foreach ($f in $changed) {
+        $full = Join-PathX $srcRoot ($f -replace '/','\')
+        $onDisk = Test-Path -Path $full -PathType Leaf
+        $hash = ""; $bytes = 0
+        if ($onDisk) {
+            # ship only shippable source extensions into source/
+            if ($f -match '\.(p|w|cls|i|t)$') {
+                $dest = Join-PathX $srcStage ($f -replace '/','\')
+                $null = New-Item -ItemType Directory -Path (Split-Path $dest -Parent) -Force -ErrorAction SilentlyContinue
+                Copy-Item -Path $full -Destination $dest -Force
+            }
+            $hash = (Get-FileHash -Path $full -Algorithm SHA256).Hash
+            $bytes = (Get-Item -Path $full).Length
+        }
+        $revLines = if ($onDisk) { Get-PackageRevisionLines -FullPath $full -MarkerHits $(if ($markers -and $markers.MarkerText.ContainsKey($f)) { $markers.MarkerText[$f] } else { @() }) } else { @() }
+        $changedManifest.Add([PSCustomObject]@{ path=$f; sha256=$hash; bytes=$bytes; onDisk=$onDisk; revisionHistory=@($revLines) })
+    }
+
+    $rcodeManifest = New-Object System.Collections.Generic.List[object]
+    foreach ($u in $rcodeSet) {
+        $rFull = Join-PathX $srcRoot (($u -replace '/','\') + ".r")
+        if (-not (Test-Path -Path $rFull -PathType Leaf)) {
+            Write-Message ("  Package: expected r-code missing after clean compile: {0}.r - aborting (fail closed)." -f $u) -Fore Red
+            Remove-Item -Path $staging -Recurse -Force -ErrorAction SilentlyContinue
+            $script:OnError = $true; return
+        }
+        $dest = Join-PathX $rStage (($u -replace '/','\') + ".r")
+        $null = New-Item -ItemType Directory -Path (Split-Path $dest -Parent) -Force -ErrorAction SilentlyContinue
+        Copy-Item -Path $rFull -Destination $dest -Force
+        $rcodeManifest.Add([PSCustomObject]@{ path=($u + ".r"); sha256=(Get-FileHash -Path $rFull -Algorithm SHA256).Hash; bytes=(Get-Item -Path $rFull).Length })
+    }
+
+    $dfNames = @()
+    foreach ($d in $dfFiles) {
+        $leaf = Split-Path $d -Leaf
+        Copy-Item -Path $d -Destination (Join-PathX $dfStage $leaf) -Force
+        $dfNames += $leaf
+    }
+
+    # ---- Manifest -------------------------------------------------------------
+    $gitCommits = @()
+    if (-not [string]::IsNullOrWhiteSpace($FileList) -and [string]::IsNullOrWhiteSpace($Grep) -and [string]::IsNullOrWhiteSpace($FromCommit)) {
+        $gitCommits = @("N/A (explicit file list)")
+    } else {
+        $gitCommits = @($csCommits)
+        if (-not [string]::IsNullOrWhiteSpace($FileList)) { $gitCommits += "N/A (explicit file list)" }
+    }
+    $gitBranch = (& git -C $srcRoot rev-parse --abbrev-ref HEAD 2>&1 | Select-Object -First 1)
+
+    $manifestObj = [PSCustomObject]@{
+        project        = $projTok
+        stamp          = (Get-Date).ToString("o")
+        author         = $env:USERNAME
+        oeVersion      = $Item.OEVersion
+        compiledAgainst= [PSCustomObject]@{ app=$Item.App; site=$Item.Site; env=$Item.Env; server=$Item.Server }
+        full           = [bool]$Full
+        mode           = "full"
+        gitBranch      = "$gitBranch".Trim()
+        gitCommits     = @($gitCommits)
+        deltaDf        = @($dfNames)
+        changedSource  = @($changedManifest)
+        rcode          = @($rcodeManifest)
+        markerDrift    = [PSCustomObject]@{ markerNoGit=@($markers.MarkerNoGit); gitNoMarker=@($markers.GitNoMarker) }
+        deployNotes    = "Load any df/ deltas FIRST (DBA-run, in listed order), then r-code + source. deploy.ps1 is dry-run by default; use -Execute."
+    }
+    Set-Content -Path (Join-PathX $staging "manifest.json") -Value ($manifestObj | ConvertTo-Json -Depth 8) -Encoding ascii
+
+    # Human-readable manifest.txt
+    $mt = New-Object System.Collections.Generic.List[string]
+    $mt.Add("OEAdmin -Package manifest"); $mt.Add("=========================")
+    $mt.Add("Project        : $projTok")
+    $mt.Add("Built          : $($manifestObj.stamp)  by $($manifestObj.author)")
+    $mt.Add("Compiled for   : $($Item.App) / $($Item.Site) / $($Item.Env)  (OE $($Item.OEVersion), server $($Item.Server))")
+    $mt.Add("Mode           : " + $(if ($Full -eq $true) { "FULL (all r-code)" } else { "changes (dependency-aware)" }))
+    $mt.Add("Git branch     : $($manifestObj.gitBranch)")
+    $mt.Add("Git commits    : " + (@($gitCommits) -join ', '))
+    $mt.Add("Delta DFs      : " + $(if ($dfNames.Count) { ($dfNames -join ', ') } else { "(none)" }))
+    $mt.Add("")
+    $mt.Add("Changed source ($($changedManifest.Count)):")
+    foreach ($c in $changedManifest) { $mt.Add(("  {0}  {1} bytes  sha256 {2}{3}" -f $c.path, $c.bytes, $c.sha256, $(if ($c.onDisk) { "" } else { "  [MISSING ON DISK]" }))) }
+    $mt.Add("")
+    $mt.Add("R-code shipped ($($rcodeManifest.Count)):")
+    foreach ($r in $rcodeManifest) { $mt.Add(("  {0}  {1} bytes  sha256 {2}" -f $r.path, $r.bytes, $r.sha256)) }
+    $mt.Add("")
+    if (@($markers.MarkerNoGit).Count -or @($markers.GitNoMarker).Count) {
+        $mt.Add("Marker drift (advisory):")
+        foreach ($f in @($markers.MarkerNoGit)) { $mt.Add("  marker-no-git : $f") }
+        foreach ($f in @($markers.GitNoMarker)) { $mt.Add("  git-no-marker : $f") }
+        $mt.Add("")
+    }
+    $mt.Add("Deploy: $($manifestObj.deployNotes)")
+    Set-Content -Path (Join-PathX $staging "manifest.txt") -Value $mt -Encoding ascii
+
+    # ---- deploy.ps1 -----------------------------------------------------------
+    $deployDefaultBackup = if (-not [string]::IsNullOrWhiteSpace($PackageBackupDir)) { $PackageBackupDir } else { $App1BackupDir }
+    $deployScript = Get-PackageDeployScript -DefaultBackupDir $deployDefaultBackup
+    Set-Content -Path (Join-PathX $staging "deploy.ps1") -Value $deployScript -Encoding ascii
+
+    # ---- Zip ------------------------------------------------------------------
+    try {
+        if (Test-Path -Path $zipPath) { Remove-Item -Path $zipPath -Force -ErrorAction SilentlyContinue }
+        Compress-Archive -Path (Join-PathX $staging '*') -DestinationPath $zipPath -Force -ErrorAction Stop
+    } catch {
+        Write-Message ("  Package: zip write failed: {0}  (staging left for inspection: {1})" -f $_.Exception.Message, $staging) -Fore Red
+        $script:OnError = $true; return
+    }
+
+    Write-Message ("  Package built: {0}" -f $zipPath) -Fore Green
+    Write-Message ("    changed source: {0}   r-code: {1}   delta DF: {2}" -f $changedManifest.Count, $rcodeManifest.Count, $dfNames.Count) -Fore DarkGray
+    Write-Message ("    review file  : {0}" -f $reviewFile) -Fore DarkGray
+    # Keep the zip, review files, and compile log; remove the bulky staging tree.
+    Remove-Item -Path $staging -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# The deploy.ps1 shipped inside each bundle.  Safe by default: dry-run preview
+# unless -Execute; backs up each target before overwrite; -Rollback restores a
+# prior backup set; delta-DF load is PRINTED for the DBA and awaited, never shelled.
+function Get-PackageDeployScript {
+    param($DefaultBackupDir)
+    $backupDefault = ($DefaultBackupDir -replace "'", "''")
+    return @"
+<#
+  deploy.ps1 - OEAdmin release-bundle deployer (ships inside the package).
+  SAFE BY DEFAULT: with no -Execute it only PREVIEWS (changes nothing).
+  Backs up every target file before overwriting; -Rollback restores a backup set.
+  Delta .df loads are PRINTED for the DBA to run, then awaited - never shelled.
+#>
+param(
+  [switch]`$Execute,                 # make changes; default = dry-run preview
+  [switch]`$Rollback,                # restore a prior backup set (needs -Stamp)
+  `$Stamp = "",                      # which backup set to roll back
+  `$PackageBackupDir = '$backupDefault',   # backup root (CHANGE THIS if needed)
+  `$TargetRoot = "",                 # production app root the app-rel paths map onto (REQUIRED)
+  [switch]`$DfLoadConfirmed          # non-interactive: affirm the DF load succeeded
+)
+
+`$ErrorActionPreference = 'Stop'
+`$here = Split-Path -Parent `$MyInvocation.MyCommand.Path
+function Say(`$m, `$c = 'Gray') { Write-Host `$m -ForegroundColor `$c }
+
+if ([string]::IsNullOrWhiteSpace(`$TargetRoot)) {
+  Say "ERROR: -TargetRoot <production app root> is required (where source/ and rcode/ deploy to)." Red
+  exit 1
+}
+`$manifestPath = Join-Path `$here 'manifest.json'
+if (-not (Test-Path `$manifestPath)) { Say "ERROR: manifest.json not found beside deploy.ps1." Red; exit 1 }
+`$manifest = Get-Content `$manifestPath -Raw | ConvertFrom-Json
+`$deployStamp = [DateTime]::Now.ToString('yyyy-MM-dd_HHmmss')
+
+# ---- Rollback -------------------------------------------------------------
+if (`$Rollback) {
+  if ([string]::IsNullOrWhiteSpace(`$Stamp)) { Say "ERROR: -Rollback requires -Stamp <backup set>." Red; exit 1 }
+  `$bset = Join-Path (Join-Path `$PackageBackupDir 'oeadmin-deploy') `$Stamp
+  if (-not (Test-Path `$bset)) { Say "ERROR: backup set not found: `$bset" Red; exit 1 }
+  Say "Rolling back from `$bset -> `$TargetRoot" Cyan
+  Get-ChildItem -Path `$bset -Recurse -File | ForEach-Object {
+    `$rel = `$_.FullName.Substring(`$bset.Length).TrimStart('\','/')
+    `$tgt = Join-Path `$TargetRoot `$rel
+    if (`$Execute) {
+      `$null = New-Item -ItemType Directory -Path (Split-Path `$tgt -Parent) -Force
+      Copy-Item -Path `$_.FullName -Destination `$tgt -Force
+      Say "  restored `$rel" Green
+    } else { Say "  [PREVIEW] would restore `$rel" DarkGray }
+  }
+  if (-not `$Execute) { Say "Preview only. Re-run with -Execute to restore." Yellow }
+  exit 0
+}
+
+# ---- Delta DF step (FIRST) - printed for the DBA, then awaited ------------
+`$dfs = @(`$manifest.deltaDf)
+if (`$dfs.Count -gt 0) {
+  Say "" ; Say "This release carries $(`$dfs.Count) schema delta .df file(s). They MUST be loaded FIRST," Yellow
+  Say "in this order, into the target database BEFORE the code is deployed:" Yellow
+  foreach (`$d in `$dfs) {
+    Say "   df\$d" Yellow
+    Say "     REM prodict/load_df.p takes an INPUT PARAMETER - RUN it from a driver (cannot use -param):" DarkGray
+    Say "     REM   _loaddf.p :  RUN prodict/load_df.p (INPUT `"`$here\df\$d`")." DarkGray
+    Say "     REM   `"%DLC%\bin\_progres`" -db <targetdb> -ld <ld> -1 -p _loaddf.p   (driver reads the .df path from an env var, e.g. DF_FILE=`$here\df\$d)" DarkGray
+  }
+  if (`$Execute) {
+    `$ok = if (`$DfLoadConfirmed) { `$true } elseif ([Environment]::UserInteractive) {
+      (Read-Host "Have ALL delta DF(s) above been loaded successfully into the target DB? (y/N)") -match '^(y|yes)$'
+    } else { `$false }
+    if (-not `$ok) { Say "DF load not confirmed (pass -DfLoadConfirmed non-interactively, or answer y). Aborting before any code change." Red; exit 1 }
+  } else {
+    Say "  [PREVIEW] -Execute would await confirmation the DF(s) are loaded before deploying code." DarkGray
+  }
+}
+
+# ---- Code swap (source\ + rcode\), backup-before-overwrite ----------------
+`$backupSet = Join-Path (Join-Path `$PackageBackupDir 'oeadmin-deploy') `$deployStamp
+`$changed = 0; `$errors = 0
+foreach (`$sub in @('source','rcode')) {
+  `$base = Join-Path `$here `$sub
+  if (-not (Test-Path `$base)) { continue }
+  Get-ChildItem -Path `$base -Recurse -File | ForEach-Object {
+    `$rel = `$_.FullName.Substring(`$base.Length).TrimStart('\','/')
+    `$tgt = Join-Path `$TargetRoot `$rel
+    if (`$Execute) {
+      if (Test-Path `$tgt) {
+        `$bkp = Join-Path `$backupSet `$rel
+        `$null = New-Item -ItemType Directory -Path (Split-Path `$bkp -Parent) -Force
+        Copy-Item -Path `$tgt -Destination `$bkp -Force
+        if (-not (Test-Path `$bkp) -or (Get-Item `$bkp).Length -ne (Get-Item `$tgt).Length) {
+          Say "  ERROR: backup verify failed for `$rel - NOT overwriting." Red; `$errors++; return
+        }
+      }
+      `$null = New-Item -ItemType Directory -Path (Split-Path `$tgt -Parent) -Force
+      Copy-Item -Path `$_.FullName -Destination `$tgt -Force
+      Say "  deployed `$sub\`$rel" Green; `$changed++
+    } else {
+      `$act = if (Test-Path `$tgt) { 'replace (backup first)' } else { 'create' }
+      Say "  [PREVIEW] would `$act : `$rel  -> `$tgt" DarkGray
+    }
+  }
+}
+
+if (`$Execute) {
+  Say "" ; Say "Deployed `$changed file(s). Backup set: `$backupSet" Green
+  if (`$errors -gt 0) { Say "`$errors file(s) skipped due to backup-verify failure - review above." Red }
+  Say "Rollback with:  .\deploy.ps1 -Rollback -Stamp `$deployStamp -TargetRoot `"`$TargetRoot`" -Execute" Cyan
+} else {
+  Say "" ; Say "Preview only. Re-run with -Execute (and -TargetRoot) to deploy." Yellow
+}
+"@
 }
 
 # ---- Binary file split / join (for large-backup copy) ------------------------
@@ -3290,6 +4187,7 @@ function Invoke-Menu {
         [pscustomobject]@{ Label="Client     - launch Progress GUI client";           Value="Client" }
         [pscustomobject]@{ Label="Batch      - run a Progress program in batch";      Value="Batch" }
         [pscustomobject]@{ Label="Compile    - compile app source (OECompiler.p)";    Value="Compile" }
+        [pscustomobject]@{ Label="Package    - build a release bundle (source+rcode+manifest)"; Value="Package" }
         [pscustomobject]@{ Label="Git        - local repo/worktree maintenance";      Value="Git" }
     )
     if ($null -eq $action) { return $false }
@@ -3303,6 +4201,10 @@ function Invoke-Menu {
     $script:Incremental=$false; $script:Listing=$false; $script:Xref=$false
     $script:XrefXml=$false; $script:Installed=$false
     $script:Exclude=@(); $script:ExcludeFile=""
+    $script:Package=$false; $script:Project=""; $script:Grep=""
+    $script:FromCommit=""; $script:ToCommit=""; $script:FileList=""
+    $script:Accept=$false; $script:DeltaDf=@(); $script:DfLoadedConfirmed=$false
+    $script:Full=$false; $script:PackageBackupDir=""
     $script:AsyncCopy=$false; $script:Dest=""
     $script:Git=$false; $script:UpdateRepos=$false
     $script:NewWorkspace=$false; $script:BaseBranch=""; $script:NewBranch=""; $script:BootstrapClone=$false
@@ -3551,6 +4453,73 @@ function Invoke-Menu {
             & $askIniPfOverride
         }
 
+        "Package" {
+            $script:Package = $true
+            # App + required Site/Env (same as Compile/Client/Batch).
+            $app = & $askApp $false; if ($null -eq $app) { return $false }
+            $script:App = $app
+            if (-not (& $askClientEnv $app)) { return $false }
+
+            # Source: a git working copy (default) or the installed code.
+            $wcs = @(Get-WorkingCopies -App $app)
+            if ($wcs.Count -gt 0) {
+                $wsOpts = @()
+                foreach ($w in $wcs) { $wsOpts += [pscustomobject]@{ Label=("{0}  [{1}]" -f $w.Token, $w.Repo); Value=$w.Token; Valid=$true } }
+                $wsOpts += [pscustomobject]@{ Label="(installed code - -Installed)"; Value="__INSTALLED__"; Valid=$true }
+                $wsPick = Read-MenuChoice -Title "Package which source?" -Options $wsOpts
+                if ($null -eq $wsPick) { return $false }
+                if ($wsPick -eq "__INSTALLED__") {
+                    $script:Installed = $true
+                } else {
+                    $script:Workspace = $wsPick
+                    $script:UpdateRepos = Read-YesNo -Prompt "Fast-forward (pull) this working copy before packaging?" -Default:$false
+                }
+            } else {
+                Write-Host "  No worktrees discovered - packaging the installed code." -ForegroundColor Yellow
+                $script:Installed = $true
+            }
+
+            # -Project is REQUIRED (keys the review file + names the bundle).
+            do { $pjIn = (Read-Host "  Project / ticket name (required)").Trim() } while ([string]::IsNullOrWhiteSpace($pjIn))
+            $script:Project = $pjIn
+
+            # -Full?  If yes, change-set inputs are optional.
+            $script:Full = Read-YesNo -Prompt "Full package (recompile + ship EVERYTHING; DB/CRC-change case)?" -Default:$false
+
+            # Change-set inputs (at least one required unless -Full).
+            if (-not $script:Full) {
+                do {
+                    $grepIn = (Read-Host "  Change-set: git --grep tag (Enter to use a commit range / file list instead)").Trim()
+                    if (-not [string]::IsNullOrWhiteSpace($grepIn)) { $script:Grep = $grepIn }
+                    $fromIn = (Read-Host "  Change-set: -FromCommit (Enter to skip)").Trim()
+                    if (-not [string]::IsNullOrWhiteSpace($fromIn)) {
+                        $script:FromCommit = $fromIn
+                        do { $toIn = (Read-Host "  Change-set: -ToCommit (required with -FromCommit)").Trim() } while ([string]::IsNullOrWhiteSpace($toIn))
+                        $script:ToCommit = $toIn
+                    }
+                    $flIn = (Read-Host "  Change-set: -FileList path (Enter to skip)").Trim()
+                    if (-not [string]::IsNullOrWhiteSpace($flIn)) { $script:FileList = $flIn }
+                    $haveOne = (-not [string]::IsNullOrWhiteSpace($script:Grep)) -or (-not [string]::IsNullOrWhiteSpace($script:FromCommit)) -or (-not [string]::IsNullOrWhiteSpace($script:FileList))
+                    if (-not $haveOne) { Write-Host "  At least one change-set input is required (or choose Full)." -ForegroundColor Yellow }
+                } while (-not $haveOne)
+            }
+
+            # Delta DFs (optional) + the SEPARATE DF-loaded confirmation.
+            $dfIn = (Read-Host "  Delta .df file(s) to carry, comma-separated (Enter for none)").Trim()
+            if (-not [string]::IsNullOrWhiteSpace($dfIn)) {
+                $script:DeltaDf = @($dfIn)
+                $script:DfLoadedConfirmed = Read-YesNo -Prompt "  Confirm these delta DF(s) are ALREADY LOADED into the compile DB (required to trust the r-code CRC)?" -Default:$false
+            }
+
+            & $askIniPfOverride
+
+            # Two-pass gate: resolve-and-review, or accept-and-build now.
+            Write-Host ""
+            Write-Host "  -Package runs in two passes: RESOLVE writes a change-set file for you to review," -ForegroundColor Cyan
+            Write-Host "  then ACCEPT (re-checks it matches) compiles fresh and builds the bundle." -ForegroundColor Cyan
+            $script:Accept = Read-YesNo -Prompt "Accept and BUILD now? (No = resolve + review only)" -Default:$false
+        }
+
         "Git" {
             $script:Git = $true
             # Two groups: everyday "day in the life" commands (operate in ONE working
@@ -3723,6 +4692,19 @@ function Invoke-Menu {
         if (@($script:Exclude).Count -gt 0) { $parts += "-Exclude `"$(@($script:Exclude) -join ',')`"" }
         if (-not [string]::IsNullOrWhiteSpace($script:ExcludeFile)) { $parts += "-ExcludeFile `"$($script:ExcludeFile)`"" }
     }
+    if ($script:Package -eq $true) {
+        if (-not [string]::IsNullOrWhiteSpace($script:Project))    { $parts += "-Project `"$($script:Project)`"" }
+        if (-not [string]::IsNullOrWhiteSpace($script:Grep))       { $parts += "-Grep `"$($script:Grep)`"" }
+        if (-not [string]::IsNullOrWhiteSpace($script:FromCommit)) { $parts += "-FromCommit $($script:FromCommit)" }
+        if (-not [string]::IsNullOrWhiteSpace($script:ToCommit))   { $parts += "-ToCommit $($script:ToCommit)" }
+        if (-not [string]::IsNullOrWhiteSpace($script:FileList))   { $parts += "-FileList `"$($script:FileList)`"" }
+        if (@($script:DeltaDf).Count -gt 0) { $parts += "-DeltaDf `"$(@($script:DeltaDf) -join ',')`"" }
+        if ($script:DfLoadedConfirmed -eq $true) { $parts += "-DfLoadedConfirmed" }
+        if ($script:Full -eq $true)              { $parts += "-Full" }
+        if ($script:Accept -eq $true)            { $parts += "-Accept" }
+        if (-not [string]::IsNullOrWhiteSpace($script:PackageBackupDir)) { $parts += "-PackageBackupDir `"$($script:PackageBackupDir)`"" }
+        if ($script:Installed -eq $true)   { $parts += "-Installed" }
+    }
     if (-not [string]::IsNullOrWhiteSpace($script:Ini)) { $parts += "-Ini `"$($script:Ini)`"" }
     if (-not [string]::IsNullOrWhiteSpace($script:Pf))  { $parts += "-Pf `"$($script:Pf)`"" }
     if (@($script:AddPfs).Count -gt 0) { $parts += "-AddPfs `"$(@($script:AddPfs) -join ',')`"" }
@@ -3885,6 +4867,8 @@ Write-Message "Client action:        Client=$Client Run=$Run Ini='$Ini' Pf='$Pf'
 Write-Message "Batch action:         Batch=$Batch Pgm='$Pgm'" -Fore Blue
 Write-Message "Compile action:       Compile=$Compile FileSpec='$FileSpec' Dir='$Dir' Incremental=$Incremental Listing=$Listing Xref=$Xref XrefXml=$XrefXml Installed=$Installed" -Fore Blue
 Write-Message "Compile excludes:     Exclude='$(@($Exclude) -join ',')' ExcludeFile='$ExcludeFile'" -Fore Blue
+Write-Message "Package action:       Package=$Package Project='$Project' Accept=$Accept Full=$Full DfLoadedConfirmed=$DfLoadedConfirmed" -Fore Blue
+Write-Message "Package change-set:   Grep='$Grep' FromCommit='$FromCommit' ToCommit='$ToCommit' FileList='$FileList' DeltaDf='$(@($DeltaDf) -join ',')'" -Fore Blue
 Write-Message "Checks:               CheckAdminServer=$CheckAdminServer CheckPort=$CheckPort CheckLogErrors=$CheckLogErrors RestartOnError=$RestartOnError" -Fore Blue
 Write-Message "SettingsBackup:       SettingsBackup=$SettingsBackup ForceBackup=$ForceBackup" -Fore Blue
 Write-Message "DryRun / Menu:        DryRun=$DryRun Menu=$Menu" -Fore Blue
@@ -4261,6 +5245,33 @@ if ($Compile -eq $true) {
     $pt = @($pt | Group-Object { "{0}|{1}|{2}|{3}|{4}" -f $_.Server, $_.App, $_.Env, $_.Site, $_.DLC } |
                   ForEach-Object { $_.Group[0] })
     foreach ($t in $pt) { if (Test-CanAct -Item $t) { Do-Compile -Item $t } }
+}
+
+# PACKAGE - build a release bundle (changed source + dependency-aware r-code +
+# manifest + deploy.ps1) for one environment.  Same target rules / launch
+# machinery as -Compile (-Site AND -Env REQUIRED; r-code CRC tied to the schema).
+# LOCAL build only (-Remote refused).  Two-pass resolve/accept gate inside Do-Package.
+if ($Package -eq $true) {
+    Write-Section "PACKAGE (release bundle)"
+    # -UpdateRepos with a -Workspace: fast-forward the chosen working copy first.
+    if ($UpdateRepos -eq $true -and -not [string]::IsNullOrWhiteSpace($Workspace)) {
+        $wc = @(Get-WorkingCopies -App $App | Where-Object { $_.Token -ieq $Workspace })[0]
+        if ($wc) { Invoke-UpdateRepos -App $wc.App -OnlyRepo $wc.Repo -OnlyToken $wc.Token }
+    }
+
+    # Same environment selection as -Compile.  -Site and -Env are REQUIRED because
+    # the compiled r-code CRC is tied to the schema.
+    $pkgt = if (Test-ClientTargets -Tag "Package") {
+        @($Targets | Where-Object { $_.Component -eq "Database" })
+    } else { @() }
+
+    if ($pkgt.Count -eq 0) {
+        Write-Message "  No valid target selected for -Package (App1: -Site S1|S2 + -Env Dev|Test|SBox; App2: -Env Dev|Test|SBox; or pass -Ini and -Pf explicitly). -Site AND -Env are REQUIRED." -Fore Yellow
+    }
+    # One package per environment (exe/ini/pf resolve per env; see -Compile note).
+    $pkgt = @($pkgt | Group-Object { "{0}|{1}|{2}|{3}|{4}" -f $_.Server, $_.App, $_.Env, $_.Site, $_.DLC } |
+                      ForEach-Object { $_.Group[0] })
+    foreach ($t in $pkgt) { if (Test-CanAct -Item $t) { Do-Package -Item $t } }
 }
 
 # NOTIFICATIONS - email + Windows EventLog on any error.
