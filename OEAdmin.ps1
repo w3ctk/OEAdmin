@@ -3839,6 +3839,16 @@ function Do-Package {
     $jLines.Add('}')
     Set-Content -Path (Join-PathX $staging "manifest.json") -Value ($jLines -join "`r`n") -Encoding ascii
 
+    # Fail closed: a bundle with an empty/missing manifest.json is useless (deploy.ps1
+    # refuses it).  If the write did not produce real content, abort the package
+    # rather than shipping a broken zip.
+    $manifestJsonPath = Join-PathX $staging "manifest.json"
+    if (-not (Test-Path -Path $manifestJsonPath -PathType Leaf) -or (Get-Item -Path $manifestJsonPath).Length -lt 2) {
+        Write-Message "  Package: manifest.json came out empty - aborting (fail closed); no zip written." -Fore Red
+        Write-Message ("    (staging kept for review: {0})" -f $staging) -Fore DarkGray
+        $script:OnError = $true; return
+    }
+
     # Human-readable manifest.txt
     $mt = New-Object System.Collections.Generic.List[string]
     $mt.Add("OEAdmin -Package manifest"); $mt.Add("=========================")
