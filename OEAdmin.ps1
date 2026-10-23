@@ -3655,28 +3655,30 @@ function Do-Package {
             Write-Message ("    (staging kept for review: {0})" -f $staging) -Fore DarkGray
             $script:OnError = $true; return
         }
-        # Assign every .r to its owning (deepest) PROPATH entry, so each .r lands in
-        # exactly one library.  Walk DEEPEST-FIRST; a deeper entry claims its subtree
-        # before a shallower ancestor sees it.
-        $claimed = @{}   # full lowercase .r path -> $true once owned
+        # Assign every shippable library member to its owning (deepest) PROPATH entry,
+        # so each file lands in exactly one library.  Walk DEEPEST-FIRST; a deeper
+        # entry claims its subtree before a shallower ancestor sees it.  Members are
+        # the compiled .r PLUS the .wrx window-resource files that .w programs load at
+        # runtime (a .wrx sits beside its .r, so it is owned by the same PROPATH entry).
+        $claimed = @{}   # full lowercase member path -> $true once owned
         foreach ($pp in @($ppDirs)) {
             $ppDirN = $pp.Dir.TrimEnd('\')
             $owned = New-Object System.Collections.Generic.List[string]   # paths relative to $ppDirN
-            foreach ($ri in (Get-ChildItem -Path $ppDirN -Recurse -File -Filter *.r -ErrorAction SilentlyContinue)) {
+            foreach ($ri in (Get-ChildItem -Path $ppDirN -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -eq '.r' -or $_.Extension -eq '.wrx' })) {
                 $full = $ri.FullName
                 $fl = $full.ToLower()
                 if ($claimed.ContainsKey($fl)) { continue }        # already owned by a deeper entry
                 $claimed[$fl] = $true
                 $owned.Add($full.Substring($ppDirN.Length).TrimStart('\'))   # relative to THIS .pl's dir
             }
-            if ($owned.Count -eq 0) { continue }                   # skip empties
+            if ($owned.Count -eq 0) { continue }                   # skip empties (no .r or .wrx)
 
             $plName  = $pp.PlName
             $plStage = Join-PathX $staging $plName                 # ZIP root
             $plBuild = Join-PathX $ppDirN $plName                  # built in-place in the PROPATH dir, then moved
             if (Test-Path -Path $plBuild) { Remove-Item -Path $plBuild -Force -ErrorAction SilentlyContinue }
 
-            Write-Message ("  -ShipPL: building {0} from {1} r-code file(s) under {2}..." -f $plName, $owned.Count, $(if ($pp.Rel -eq "") { "<root>" } else { $pp.Rel })) -Fore Cyan
+            Write-Message ("  -ShipPL: building {0} from {1} member(s) (.r + .wrx) under {2}..." -f $plName, $owned.Count, $(if ($pp.Rel -eq "") { "<root>" } else { $pp.Rel })) -Fore Cyan
             # Run prolib with CWD = THIS PROPATH dir so members store relative to it.
             # -create precedes -add; add in batches to stay under the OS cmd-line limit.
             $plOk = $true; $plErr = ""
@@ -3719,7 +3721,7 @@ function Do-Package {
             Write-Message ("  -ShipPL: {0} built ({1} files, {2} bytes)" -f $plName, $owned.Count, (Get-Item -Path $plStage).Length) -Fore Green
         }
         if ($plInfoList.Count -eq 0) {
-            Write-Message "  Package: -ShipPL produced no libraries (no PROPATH entry under the compile root held r-code) - aborting (fail closed)." -Fore Red
+            Write-Message "  Package: -ShipPL produced no libraries (no PROPATH entry under the compile root held .r/.wrx) - aborting (fail closed)." -Fore Red
             Write-Message ("    (staging kept for review: {0})" -f $staging) -Fore DarkGray
             $script:OnError = $true; return
         }
