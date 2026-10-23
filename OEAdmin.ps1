@@ -3366,10 +3366,12 @@ function Do-Package {
     }
 
     # -ShipPL ships COMPLETE per-PROPATH-entry procedure libraries, so it always
-    # packages the whole tree's r-code: -ShipPL implies -Full.  Assigning $Full here
-    # shadows the param for the rest of this function.
+    # packages the whole tree's r-code: -ShipPL implies -Full.  Use a PLAIN [bool]
+    # ($isFull) downstream rather than reassigning the [switch] param $Full (a
+    # SwitchParameter leaking into a value throws "Argument types do not match" on
+    # Windows PowerShell 5.1).
+    $isFull = ($Full -eq $true) -or ($ShipPL -eq $true)
     if ($ShipPL -eq $true -and $Full -ne $true) {
-        $Full = $true
         Write-Message "  -ShipPL implies -Full (shipping complete per-PROPATH procedure libraries)." -Fore DarkGray
     }
 
@@ -3383,7 +3385,7 @@ function Do-Package {
                  (-not [string]::IsNullOrWhiteSpace($FromCommit)) -or
                  (-not [string]::IsNullOrWhiteSpace($ToCommit))  -or
                  (-not [string]::IsNullOrWhiteSpace($FileList))
-    if (-not $haveInput -and $Full -ne $true) {
+    if (-not $haveInput -and -not $isFull) {
         Write-Message "  Package: needs a change-set input (-Grep / -FromCommit+-ToCommit / -FileList) or -Full." -Fore Red
         $script:OnError = $true; return
     }
@@ -3403,7 +3405,7 @@ function Do-Package {
     $staging    = Join-PathX $pkgRoot ("{0}_{1}" -f $projTok, $stamp)
     $zipPath    = Join-PathX $pkgRoot ("{0}_{1}.zip" -f $projTok, $stamp)
 
-    Write-Message ("Package: {0,-38} {1}  [{2}]" -f (& $Label $Item), $L.ExeName, $(if ($Full -eq $true){"full"}else{"changes"})) -Fore Cyan
+    Write-Message ("Package: {0,-38} {1}  [{2}]" -f (& $Label $Item), $L.ExeName, $(if ($isFull){"full"}else{"changes"})) -Fore Cyan
     Write-Message ("  source root : {0}   (repo {1}, app segment '{2}')" -f $srcRoot, $repoInfo.RepoRoot, $appSeg) -Fore DarkGray
     Write-Message ("  project     : {0}" -f $projTok) -Fore DarkGray
 
@@ -3444,7 +3446,7 @@ function Do-Package {
         "# target    : $($Item.App) / $($Item.Site) / $($Item.Env)  (server $($Item.Server))",
         "# source    : $srcRoot",
         "# appSegment: $appSeg",
-        "# inputs    : Grep='$Grep' FromCommit='$FromCommit' ToCommit='$ToCommit' FileList='$FileList' Full=$Full",
+        "# inputs    : Grep='$Grep' FromCommit='$FromCommit' ToCommit='$ToCommit' FileList='$FileList' Full=$isFull ShipPL=$ShipPL",
         "# drift     : markerNoGit=$(@($markers.MarkerNoGit).Count) gitNoMarker=$(@($markers.GitNoMarker).Count)",
         "# SETHASH=$setHash",
         "#",
@@ -3543,7 +3545,7 @@ function Do-Package {
 
     # ---- Dependency-aware r-code ship set -------------------------------------
     $rcodeSet = @()
-    if ($Full -eq $true) {
+    if ($isFull) {
         # ship every .r produced beside source under $srcRoot
         $rItems = Get-ChildItem -Path $srcRoot -Recurse -File -Filter *.r -ErrorAction SilentlyContinue
         $srcN = ($srcRoot -replace '\\','/').TrimEnd('/')
@@ -3600,7 +3602,10 @@ function Do-Package {
             $bytes = (Get-Item -Path $full).Length
         }
         $revLines = if ($onDisk) { Get-PackageRevisionLines -FullPath $full -MarkerHits $(if ($markers -and $markers.MarkerText.ContainsKey($f)) { $markers.MarkerText[$f] } else { @() }) } else { @() }
-        $changedManifest.Add([PSCustomObject]@{ path=$f; sha256=$hash; bytes=$bytes; onDisk=$onDisk; revisionHistory=@($revLines) })
+        # Plain [ordered] hashtable (NOT [PSCustomObject]): an array of PSCustomObject
+        # as a manifest value trips a PS 5.1 "Argument types do not match" conversion
+        # bug.  (manifest.json is emitted by hand below, from these hashtables.)
+        $changedManifest.Add([ordered]@{ path=$f; sha256=$hash; bytes=$bytes; onDisk=$onDisk; revisionHistory=@($revLines) })
     }
 
     $rcodeManifest = New-Object System.Collections.Generic.List[object]
@@ -3622,7 +3627,7 @@ function Do-Package {
         $dest = Join-PathX $rStage (($rBase -replace '/','\') + ".r")
         $null = New-Item -ItemType Directory -Path (Split-Path $dest -Parent) -Force -ErrorAction SilentlyContinue
         Copy-Item -Path $rFull -Destination $dest -Force
-        $rcodeManifest.Add([PSCustomObject]@{ path=($rBase + ".r"); sha256=(Get-FileHash -Path $rFull -Algorithm SHA256).Hash; bytes=(Get-Item -Path $rFull).Length })
+        $rcodeManifest.Add([ordered]@{ path=($rBase + ".r"); sha256=(Get-FileHash -Path $rFull -Algorithm SHA256).Hash; bytes=(Get-Item -Path $rFull).Length })
     }
 
     # ---- Optional per-PROPATH-entry procedure libraries (-ShipPL) -------------
@@ -3704,7 +3709,7 @@ function Do-Package {
                 $script:OnError = $true; return
             }
             Move-Item -Path $plBuild -Destination $plStage -Force
-            $plInfoList += [PSCustomObject]@{
+            $plInfoList += [ordered]@{
                 name   = $plName
                 dir    = $(if ($pp.Rel -eq "") { "." } else { $pp.Rel })   # app-root-relative PROPATH dir
                 sha256 = (Get-FileHash -Path $plStage -Algorithm SHA256).Hash
@@ -3754,34 +3759,85 @@ function Do-Package {
     } else {
         "Load any df/ deltas FIRST (DBA-run, in listed order), then r-code + source. deploy.ps1 is dry-run by default; use -Execute."
     }
-    # Build the manifest as an ORDERED HASHTABLE and serialize it straight to JSON.
-    # This sidesteps two Windows PowerShell 5.1 traps that bit earlier approaches:
-    #   * Add-Member -NotePropertyValue <array-of-objects> throws "Argument types do
-    #     not match" (parameter-set ambiguity on the array value).
-    #   * $obj.PSObject.Properties.Add((New-Object PSNoteProperty ...)) throws the
-    #     same on some 5.1 builds (Add() overload resolution on the note-property).
-    # ConvertTo-Json serializes an [ordered] hashtable - including nested hashtables
-    # and object arrays (List[object] of PSCustomObject) - natively, with no
-    # Add-Member / PSObject.Properties calls at all.  (Do NOT cast the [ordered] to
-    # [PSCustomObject]; THAT cast is what silently produced an empty object in 5.1.)
-    $manifestObj = [ordered]@{
-        project         = $projTok
-        stamp           = $builtStamp
-        author          = $builtBy
-        oeVersion       = $Item.OEVersion
-        compiledAgainst = [ordered]@{ app = $Item.App; site = $Item.Site; env = $Item.Env; server = $Item.Server }
-        full            = [bool]$Full
-        mode            = $(if ($Full -eq $true) { "full" } else { "changes" })
-        gitBranch       = $gitBranchStr
-        gitCommits      = @($gitCommits)
-        deltaDf         = @($dfNames)
-        changedSource   = @($changedManifest)
-        rcode           = @($rcodeManifest)
-        shipPL          = @($plInfoList)
-        markerDrift     = [ordered]@{ markerNoGit = $markerNoGit; gitNoMarker = $gitNoMarker }
-        deployNotes     = $deployNotesText
+    # Build manifest.json by hand.  EVERY object-model approach to this tried so far
+    # throws "Argument types do not match" (System.ArgumentException) at RUNTIME on
+    # Windows PowerShell 5.1 - Add-Member with an object-array value, the .NET
+    # PSNoteProperty API, AND an [ordered] hashtable literal holding arrays of
+    # PSCustomObject all hit the same conversion bug.  Emit the JSON text directly
+    # from primitives: zero exposure to PSObject/OrderedDictionary conversion, and
+    # trivially correct for this fixed schema.  Helpers do minimal string escaping.
+    function ConvertTo-JsonStr([string]$s) {
+        if ($null -eq $s) { return '""' }
+        $sb = New-Object System.Text.StringBuilder
+        [void]$sb.Append('"')
+        foreach ($ch in $s.ToCharArray()) {
+            switch ($ch) {
+                '"'  { [void]$sb.Append('\"') }
+                '\'  { [void]$sb.Append('\\') }
+                "`b" { [void]$sb.Append('\b') }
+                "`f" { [void]$sb.Append('\f') }
+                "`n" { [void]$sb.Append('\n') }
+                "`r" { [void]$sb.Append('\r') }
+                "`t" { [void]$sb.Append('\t') }
+                default {
+                    if ([int]$ch -lt 32) { [void]$sb.Append(('\u{0:x4}' -f [int]$ch)) }
+                    else { [void]$sb.Append($ch) }
+                }
+            }
+        }
+        [void]$sb.Append('"')
+        return $sb.ToString()
     }
-    Set-Content -Path (Join-PathX $staging "manifest.json") -Value ($manifestObj | ConvertTo-Json -Depth 8) -Encoding ascii
+    function ConvertTo-JsonStrArray($items) {
+        $parts = @(); foreach ($x in @($items)) { $parts += (ConvertTo-JsonStr ([string]$x)) }
+        return '[' + ($parts -join ',') + ']'
+    }
+
+    $jLines = New-Object System.Collections.Generic.List[string]
+    $jLines.Add('{')
+    $jLines.Add('  "project": '   + (ConvertTo-JsonStr $projTok) + ',')
+    $jLines.Add('  "stamp": '     + (ConvertTo-JsonStr $builtStamp) + ',')
+    $jLines.Add('  "author": '    + (ConvertTo-JsonStr $builtBy) + ',')
+    $jLines.Add('  "oeVersion": ' + (ConvertTo-JsonStr ([string]$Item.OEVersion)) + ',')
+    $jLines.Add('  "compiledAgainst": { "app": ' + (ConvertTo-JsonStr ([string]$Item.App)) +
+                ', "site": '   + (ConvertTo-JsonStr ([string]$Item.Site)) +
+                ', "env": '    + (ConvertTo-JsonStr ([string]$Item.Env)) +
+                ', "server": ' + (ConvertTo-JsonStr ([string]$Item.Server)) + ' },')
+    $jLines.Add('  "full": '      + $(if ($isFull) { 'true' } else { 'false' }) + ',')
+    $jLines.Add('  "mode": '      + (ConvertTo-JsonStr $(if ($isFull) { "full" } else { "changes" })) + ',')
+    $jLines.Add('  "gitBranch": ' + (ConvertTo-JsonStr $gitBranchStr) + ',')
+    $jLines.Add('  "gitCommits": ' + (ConvertTo-JsonStrArray $gitCommits) + ',')
+    $jLines.Add('  "deltaDf": '    + (ConvertTo-JsonStrArray $dfNames) + ',')
+    $csItems = @()
+    foreach ($c in $changedManifest) {
+        $csItems += ('{ "path": ' + (ConvertTo-JsonStr ([string]$c.path)) +
+                     ', "sha256": ' + (ConvertTo-JsonStr ([string]$c.sha256)) +
+                     ', "bytes": '  + ([long]$c.bytes) +
+                     ', "onDisk": ' + $(if ($c.onDisk) { 'true' } else { 'false' }) +
+                     ', "revisionHistory": ' + (ConvertTo-JsonStrArray $c.revisionHistory) + ' }')
+    }
+    $jLines.Add('  "changedSource": [' + ($csItems -join ', ') + '],')
+    $rcItems = @()
+    foreach ($r in $rcodeManifest) {
+        $rcItems += ('{ "path": ' + (ConvertTo-JsonStr ([string]$r.path)) +
+                     ', "sha256": ' + (ConvertTo-JsonStr ([string]$r.sha256)) +
+                     ', "bytes": '  + ([long]$r.bytes) + ' }')
+    }
+    $jLines.Add('  "rcode": [' + ($rcItems -join ', ') + '],')
+    $plItems = @()
+    foreach ($pl in $plInfoList) {
+        $plItems += ('{ "name": ' + (ConvertTo-JsonStr ([string]$pl.name)) +
+                     ', "dir": '    + (ConvertTo-JsonStr ([string]$pl.dir)) +
+                     ', "sha256": ' + (ConvertTo-JsonStr ([string]$pl.sha256)) +
+                     ', "bytes": '  + ([long]$pl.bytes) +
+                     ', "units": '  + ([long]$pl.units) + ' }')
+    }
+    $jLines.Add('  "shipPL": [' + ($plItems -join ', ') + '],')
+    $jLines.Add('  "markerDrift": { "markerNoGit": ' + (ConvertTo-JsonStrArray $markerNoGit) +
+                ', "gitNoMarker": ' + (ConvertTo-JsonStrArray $gitNoMarker) + ' },')
+    $jLines.Add('  "deployNotes": ' + (ConvertTo-JsonStr $deployNotesText))
+    $jLines.Add('}')
+    Set-Content -Path (Join-PathX $staging "manifest.json") -Value ($jLines -join "`r`n") -Encoding ascii
 
     # Human-readable manifest.txt
     $mt = New-Object System.Collections.Generic.List[string]
@@ -3789,7 +3845,7 @@ function Do-Package {
     $mt.Add("Project        : $projTok")
     $mt.Add("Built          : $builtStamp  by $builtBy")
     $mt.Add("Compiled on    : $($Item.App) / $($Item.Site) / $($Item.Env)  (OE $($Item.OEVersion), server $($Item.Server))")
-    $mt.Add("Mode           : " + $(if ($Full -eq $true) { "FULL (all r-code)" } else { "changes (dependency-aware)" }))
+    $mt.Add("Mode           : " + $(if ($isFull) { "FULL (all r-code)" } else { "changes (dependency-aware)" }))
     $mt.Add("Git branch     : $gitBranchStr")
     $mt.Add("Git commits    : " + (@($gitCommits) -join ', '))
     $mt.Add("Delta DFs      : " + $(if ($dfNames.Count) { ($dfNames -join ', ') } else { "(none)" }))
@@ -3811,7 +3867,7 @@ function Do-Package {
         foreach ($f in $gitNoMarker) { $mt.Add("  git-no-marker : $f") }
         $mt.Add("")
     }
-    $mt.Add("Deploy: $($manifestObj.deployNotes)")
+    $mt.Add("Deploy: $deployNotesText")
     Set-Content -Path (Join-PathX $staging "manifest.txt") -Value $mt -Encoding ascii
 
     # ---- deploy.ps1 -----------------------------------------------------------
