@@ -211,8 +211,8 @@ shared components (NameServer / MSSQLBroker / OracleBroker) it actually runs.
 ./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace my-feature-branch -Grep "TICKET-123"
 # Pass 2 - accept the reviewed set (re-hashes; hard-stops on drift) and build the zip
 ./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace my-feature-branch -Grep "TICKET-123" -Accept -Project TICKET-123
-# ...add -ShipPL to also bundle one <App>.pl (deploy then replaces ONLY that .pl)
-./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace my-feature-branch -Grep "TICKET-123" -Accept -Project TICKET-123 -ShipPL
+# ...add -ShipPL to build per-PROPATH .pl libraries (implies -Full; deploy then replaces ONLY the .pl files)
+./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace my-feature-branch -Accept -Project TICKET-123 -ShipPL
 
 # Run the ABLUnit suite (OpenEdge 12+); default 'tests' folder, or a specific class/method
 ./OEAdmin.ps1 -Test -App App1 -Site S1 -Env Test -Workspace my-feature-branch

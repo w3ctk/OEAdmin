@@ -277,12 +277,17 @@ the required `-Site`/`-Env` — is automatic. Delta schema files passed with
 steps and awaits confirmation; it never loads a `.df` itself, so no DB credentials
 live in the bundle.
 
-`-ShipPL` (optional, nothing to configure) also bundles a single `<App>.pl`
-procedure library at the zip root, built with the OpenEdge `prolib` utility that
-ships with every install (resolved from the target's `DLC`, so no extra setup).
-With it, the generated `deploy.ps1` backs up + replaces only that one `.pl` on the
-server instead of the loose `rcode/` tree — one file to verify. `source/` and
-`rcode/` still ride along as documentation. It is off by default.
+`-ShipPL` (optional, nothing to configure) builds **procedure libraries** — one
+`.pl` per PROPATH entry under the compile root — at the zip root, so production can
+override code via PROPATH. It **implies `-Full`** and uses the OpenEdge `prolib`
+utility that ships with every install (resolved from the target's `DLC`, so no
+extra setup). PROPATH is read from the same site INI the compile uses; each library
+is named after its PROPATH entry (root → `<App>.pl`, nested → `name-with-dashes.pl`)
+and its members are stored relative to that entry so they resolve on PROPATH. The
+generated `deploy.ps1` backs up + replaces only those `.pl` file(s) instead of the
+loose `rcode/` tree; you maintain the site INI so it lists the libraries on PROPATH
+in search order. `source/` and `rcode/` still ride along as documentation. It is
+off by default.
 
 ### Topic 15 — Test (`-Test`) — one PROPATH requirement
 

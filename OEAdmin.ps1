@@ -111,17 +111,22 @@ You may obtain a copy of the License at
         (usually the framework not on PROPATH) - sets OnTestError and exit 2004.
         OpenEdge 12+ ONLY (9.1E/10.2B targets are refused).  Wired into -Menu.
 
-1.6.0 - -Package gains -ShipPL: after the fresh full compile, bundle the shipped
-        r-code set into ONE <App>.pl procedure library at the ZIP root, built with
-        prolib from the SAME compile that drives the XREF dependency scan.  The
-        library is created with its working directory at the app source root and
-        members added by app-root-relative path, so the r-code resolves on the
-        production PROPATH.  source/ and rcode/ still ride along as documentation,
-        but the shipped deploy.ps1 then backs up + replaces ONLY that single
-        <App>.pl on the server (one file to verify instead of a tree of loose .r);
-        -Rollback restores the prior .pl.  The manifest records the .pl name, size,
-        sha256 and unit count.  Opt-in; absent = the loose source+rcode deploy.
-        Wired into -Menu / help / docs.
+1.6.0 - -Package gains -ShipPL: after the fresh full compile, bundle the whole
+        tree's r-code into PROCEDURE LIBRARIES - one .pl per PROPATH entry under the
+        compile root - so production can override code via PROPATH (r-code in a .pl
+        resolves relative to WHERE the .pl sits on PROPATH).  -ShipPL implies -Full.
+        The PROPATH is read from the SAME site INI the compile used; each entry
+        at/under the compile root gets a .pl named after it (compile root ->
+        <App>.pl; a nested entry like app2mods\sub -> app2mods-sub.pl).  Each
+        library is built with prolib from its own directory so members are stored
+        RELATIVE to that directory; an .r is owned by the NEAREST (deepest) PROPATH
+        entry containing it, so nested entries don't duplicate.  A PROPATH dir with
+        no r-code is skipped.  The .pl files sit at the ZIP root; the shipped
+        deploy.ps1 backs up + replaces ONLY those .pl file(s) (the site INI lists
+        them on PROPATH in search order); -Rollback restores them.  source/ and
+        rcode/ still ride along as documentation.  The manifest records each .pl
+        (name, PROPATH dir, size, sha256, file count).  Opt-in; absent = the loose
+        source+rcode deploy.  Wired into -Menu / help / docs.
 
 #>
 
@@ -247,10 +252,12 @@ ACTIONS:
                  review the change set, then -Accept -Project <tok> re-hashes it and
                  HARD-STOPS on drift before building.  deploy.ps1 is dry-run by
                  default (-Execute to apply), backs up before overwrite, -Rollback
-                 restores.  -ShipPL also bundles ONE <App>.pl (procedure library)
-                 at the zip root from the shipped r-code; deploy.ps1 then backs up +
-                 replaces only that single .pl on the server (source/rcode stay as
-                 documentation).  LOCAL worktree only (-Remote refused).
+                 restores.  -ShipPL (implies -Full) bundles PROCEDURE LIBRARIES -
+                 one .pl per PROPATH entry under the compile root (root -> <App>.pl,
+                 nested entries -> name-with-dashes.pl) - at the zip root so prod can
+                 override via PROPATH; deploy.ps1 then backs up + replaces only those
+                 .pl file(s) (source/rcode stay as documentation).  LOCAL worktree
+                 only (-Remote refused).
     -Test        Run the ABLUnit suite headlessly via the Progress driver
                  ABLUnitCore.p (resolved off the environment's INI PROPATH).  Same
                  launch machinery as -Compile/-Batch.  -TestSpec picks what to run
@@ -349,8 +356,8 @@ Usage examples (all switches shown; App/Site/Env names are placeholders):
     # ...ship the WHOLE source tree's r-code (DB/CRC-wide change)
     ./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace feature-x -Accept -Project FullRelease -Full
 
-    # ...also bundle a single App1.pl (deploy backs up/replaces ONLY the .pl)
-    ./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace feature-x -Grep "TICKET-123" -Accept -Project TICKET-123 -ShipPL
+    # ...build per-PROPATH .pl libraries (implies -Full; deploy backs up/replaces ONLY the .pl files)
+    ./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace feature-x -Accept -Project TICKET-123 -ShipPL
 
     # ...preview the whole run (resolve + compile launch) without building
     ./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace feature-x -Grep "TICKET-123" -Accept -Project TICKET-123 -DryRun
@@ -746,11 +753,16 @@ param (
     [switch]$Accept,
     [switch]$Full,
 
-    # -ShipPL: also build an <App>.pl procedure library from the shipped r-code and
-    # place it at the ZIP root.  source\ and rcode\ still ride along as documentation,
-    # but the shipped deploy.ps1 then backs up + replaces ONLY that single <App>.pl
-    # on the server (one file to verify).  Built with prolib from the SAME fresh full
-    # compile that drives the XREF dependency scan.
+    # -ShipPL: build PROCEDURE LIBRARIES (.pl) from the compiled r-code - ONE per
+    # PROPATH entry under the compile root - at the ZIP root, so production can
+    # override code via PROPATH.  IMPLIES -Full.  PROPATH is read from the SAME site
+    # INI the compile uses; each entry is named after its path relative to the
+    # compile root (root -> <App>.pl; nested entry -> name-with-dashes.pl).  Each
+    # library is built with prolib from its own directory so members store RELATIVE
+    # to it and resolve on the server PROPATH; an .r is owned by the NEAREST (deepest)
+    # PROPATH entry (no duplication); dirs with no r-code are skipped.  deploy.ps1
+    # backs up + replaces ONLY those .pl file(s).  source\ and rcode\ still ride
+    # along as documentation.
     [switch]$ShipPL,
 
     # -DeltaDf: schema-delta .df file(s) (comma list) to carry in the bundle; the
@@ -3280,6 +3292,59 @@ function Get-PackageRevisionLines {
     return @($lines)
 }
 
+# -ShipPL support: read the PROPATH from the compile INI and return the subset of
+# entries that live AT or UNDER the compile source root ($srcRoot) - those are the
+# directories a production override .pl must be built for (one .pl per PROPATH
+# entry, so r-code resolves relative to each entry on the server's PROPATH).
+# For each kept directory returns a PSCustomObject:
+#   Dir     - full on-disk path (under $srcRoot)
+#   Rel     - path relative to $srcRoot ("" for the root itself), backslash form
+#   PlName  - <App>.pl for the root, else the Rel path with separators -> '-' + ".pl"
+#             (e.g. app2mods\sub -> app2mods-sub.pl)
+# The list is returned DEEPEST-FIRST (most path segments first) so the caller can
+# assign each .r to its NEAREST (deepest) owning PROPATH entry without duplication.
+# Reads the INI's PROPATH= line verbatim (the -Workspace variant already has it
+# rewritten to the worktree, so segments under $srcRoot are the worktree dirs).
+function Get-PackagePropathDirs {
+    param($IniPath, $SrcRoot, $App)
+    $result = @()
+    if ([string]::IsNullOrWhiteSpace($IniPath) -or -not (Test-Path -Path $IniPath -PathType Leaf)) {
+        Write-Message ("  -ShipPL: cannot read PROPATH - INI not found: {0}" -f $IniPath) -Fore Red
+        return $null
+    }
+    $srcN = $SrcRoot.TrimEnd('\')
+    $srcLower = $srcN.ToLower()
+    $propLine = $null
+    foreach ($ln in (Get-Content -Path $IniPath -ErrorAction SilentlyContinue)) {
+        if ($ln -match '^(?i)\s*PROPATH\s*=') { $propLine = $ln; break }
+    }
+    if (-not $propLine) {
+        Write-Message ("  -ShipPL: no PROPATH= line in {0}" -f $IniPath) -Fore Red
+        return $null
+    }
+    $val = $propLine.Substring($propLine.IndexOf('=') + 1)
+    $seen = @{}
+    foreach ($seg in ($val -split ',')) {
+        $s = $seg.Trim().Trim('"').Trim()
+        if ([string]::IsNullOrWhiteSpace($s)) { continue }
+        if ($s -eq '.' ) { $s = $srcN }
+        elseif ($s -notmatch '^[A-Za-z]:' -and $s -notmatch '^\\\\' -and $s -notmatch '^/') { $s = Join-PathX $srcN $s }
+        $full = $s.TrimEnd('\')
+        $fullLower = $full.ToLower()
+        $isRoot  = ($fullLower -eq $srcLower)
+        $isUnder = $fullLower.StartsWith($srcLower + '\')
+        if (-not ($isRoot -or $isUnder)) { continue }
+        if ($seen.ContainsKey($fullLower)) { continue }
+        $seen[$fullLower] = $true
+        $rel = if ($isRoot) { "" } else { $full.Substring($srcN.Length + 1) }
+        $plName = if ($isRoot) { "$App.pl" } else { (($rel -replace '[\\/]', '-')) + ".pl" }
+        $depth = if ($isRoot) { 0 } else { @($rel -split '[\\/]').Count }
+        $result += [PSCustomObject]@{ Dir = $full; Rel = $rel; PlName = $plName; Depth = $depth }
+    }
+    # Deepest-first so ownership assignment picks the nearest PROPATH entry.
+    return @($result | Sort-Object -Property Depth -Descending)
+}
+
 # The -Package action for one resolved environment target.
 function Do-Package {
     param($Item)
@@ -3298,6 +3363,14 @@ function Do-Package {
     if (-not $srcRoot) {
         Write-Message ("  Package: could not resolve a source root for {0}" -f $Item.Name) -Fore Red
         $script:OnError = $true; return
+    }
+
+    # -ShipPL ships COMPLETE per-PROPATH-entry procedure libraries, so it always
+    # packages the whole tree's r-code: -ShipPL implies -Full.  Assigning $Full here
+    # shadows the param for the rest of this function.
+    if ($ShipPL -eq $true -and $Full -ne $true) {
+        $Full = $true
+        Write-Message "  -ShipPL implies -Full (shipping complete per-PROPATH procedure libraries)." -Fore DarkGray
     }
 
     # -Accept requires -Project (the stable review file is keyed by project).
@@ -3495,7 +3568,12 @@ function Do-Package {
         foreach ($f in $changed)  { Write-Message ("    source  {0}" -f $f) -Fore DarkGray }
         foreach ($u in $rcodeSet) { Write-Message ("    rcode   {0}.r" -f $u) -Fore DarkGray }
         foreach ($d in $dfFiles)  { Write-Message ("    df      {0}" -f (Split-Path $d -Leaf)) -Fore DarkGray }
-        if ($ShipPL -eq $true) { Write-Message ("    pl      {0}.pl  (from the {1} r-code unit(s) above; deploy backs up/replaces ONLY this file)" -f $Item.App, $rcodeSet.Count) -Fore DarkGray }
+        if ($ShipPL -eq $true) {
+            Write-Message "    pl      -ShipPL (implies -Full): one procedure library per PROPATH entry under the compile root; deploy backs up/replaces ONLY the .pl file(s)." -Fore DarkGray
+            $ppPreview = Get-PackagePropathDirs -IniPath $L.Ini -SrcRoot $srcRoot -App $Item.App
+            foreach ($pp in @($ppPreview)) { Write-Message ("              {0}   <- {1}" -f $pp.PlName, $(if ($pp.Rel -eq "") { "<root>" } else { $pp.Rel })) -Fore DarkGray }
+            Write-Message "              (a PROPATH dir with no r-code is skipped; .r is owned by its NEAREST PROPATH entry)" -Fore DarkGray
+        }
         Write-Message ("  [DRYRUN] would write: {0}" -f $zipPath) -Fore DarkGray
         Remove-Item -Path $staging -Recurse -Force -ErrorAction SilentlyContinue
         return
@@ -3547,77 +3625,100 @@ function Do-Package {
         $rcodeManifest.Add([PSCustomObject]@{ path=($rBase + ".r"); sha256=(Get-FileHash -Path $rFull -Algorithm SHA256).Hash; bytes=(Get-Item -Path $rFull).Length })
     }
 
-    # ---- Optional <App>.pl procedure library (-ShipPL) ------------------------
-    # Bundle the SAME r-code ship set into one <App>.pl at the ZIP root so prod has
-    # a single file to verify/deploy.  prolib stores whatever pathname it is given
-    # in the library's table of contents, so the entries MUST be app-root-relative
-    # (e.g. Bin\foo.r) for the r-code to resolve on the PROPATH at runtime; that
-    # means running prolib with its WORKING DIRECTORY set to $srcRoot and adding
-    # each unit by its relative path.  r-code lives beside source under $srcRoot
-    # (COMPILE ... SAVE), already confirmed present by the loop above.
-    $plInfo = $null
+    # ---- Optional per-PROPATH-entry procedure libraries (-ShipPL) -------------
+    # Build ONE .pl per PROPATH entry under the compile root so production can
+    # override code via PROPATH: r-code inside a .pl resolves relative to WHERE the
+    # .pl sits on PROPATH, so each PROPATH directory needs its own library whose
+    # members are stored relative to THAT directory.  A member is owned by the
+    # NEAREST (deepest) PROPATH entry that contains it - so a parent library excludes
+    # the subtrees owned by deeper PROPATH entries.  The compile-root entry, if
+    # present on PROPATH, becomes <App>.pl.  A PROPATH dir with no owned r-code is
+    # skipped.  r-code lives beside source under $srcRoot (COMPILE..SAVE).
+    $plInfoList = @()
     if ($ShipPL -eq $true) {
-        $plName  = "$($Item.App).pl"                       # e.g. App1.pl
-        $plStage = Join-PathX $staging $plName             # final resting place (ZIP root)
-        $plBuild = Join-PathX $srcRoot $plName             # built in-place at $srcRoot, then moved
-        $prolib  = Get-OEToolPath $Item.DLC "prolib"       # <DLC>/bin/prolib[.bat] (platform-aware)
+        $prolib = Get-OEToolPath $Item.DLC "prolib"        # <DLC>/bin/prolib[.bat] (platform-aware)
         if (-not (Test-Path -Path $prolib -PathType Leaf)) {
             Write-Message ("  Package: prolib not found for -ShipPL: {0}" -f $prolib) -Fore Red
             Write-Message ("    (staging kept for review: {0})" -f $staging) -Fore DarkGray
             $script:OnError = $true; return
         }
-        # The relative .r paths to add (backslash form, as stored in the TOC).
-        $plRelPaths = @($rcodeSet | ForEach-Object { (($_ -replace '\.(p|w|cls|t)$','') -replace '/','\') + ".r" })
-        if ($plRelPaths.Count -eq 0) {
-            Write-Message "  Package: -ShipPL requested but the r-code ship set is empty; nothing to put in the .pl - aborting (fail closed)." -Fore Red
+        # PROPATH entries at/under the compile root, DEEPEST-FIRST (from the SAME INI
+        # the compile used, so the library layout matches what was compiled against).
+        $ppDirs = Get-PackagePropathDirs -IniPath $L.Ini -SrcRoot $srcRoot -App $Item.App
+        if ($null -eq $ppDirs -or @($ppDirs).Count -eq 0) {
+            Write-Message "  Package: -ShipPL found no PROPATH entries at/under the compile root; nothing to build - aborting (fail closed)." -Fore Red
             Write-Message ("    (staging kept for review: {0})" -f $staging) -Fore DarkGray
             $script:OnError = $true; return
         }
-        # Start clean: an existing stale .pl at $srcRoot would be appended to.
-        if (Test-Path -Path $plBuild) { Remove-Item -Path $plBuild -Force -ErrorAction SilentlyContinue }
-
-        Write-Message ("  -ShipPL: building {0} from {1} r-code unit(s) via prolib..." -f $plName, $plRelPaths.Count) -Fore Cyan
-        # Run prolib with CWD=$srcRoot.  -create must precede -add (PROLIB processes
-        # left-to-right and aborts on first error).  Add in batches so the command
-        # line stays well under the OS limit on large (-Full) sets.  -nowarn makes a
-        # re-added member replace rather than error.
-        $plOk = $true; $plErr = ""
-        $created = $false
-        $batchSize = 200
-        for ($bi = 0; $bi -lt $plRelPaths.Count; $bi += $batchSize) {
-            $batch = $plRelPaths[$bi..([Math]::Min($bi + $batchSize - 1, $plRelPaths.Count - 1))]
-            $plArgs = New-Object System.Collections.Generic.List[string]
-            $plArgs.Add($plName)                            # library-name (relative to CWD=$srcRoot)
-            if (-not $created) { $plArgs.Add("-create"); $created = $true }
-            $plArgs.Add("-nowarn"); $plArgs.Add("-add")
-            foreach ($rp in $batch) { $plArgs.Add($rp) }
-            $plOut = ""
-            try {
-                Push-Location -Path $srcRoot
-                $plOut = (& $prolib @plArgs 2>&1 | ForEach-Object { "$_" }) -join "`n"
-            } catch {
-                $plOk = $false; $plErr = $_.Exception.Message
-            } finally {
-                Pop-Location
+        # Assign every .r to its owning (deepest) PROPATH entry, so each .r lands in
+        # exactly one library.  Walk DEEPEST-FIRST; a deeper entry claims its subtree
+        # before a shallower ancestor sees it.
+        $claimed = @{}   # full lowercase .r path -> $true once owned
+        foreach ($pp in @($ppDirs)) {
+            $ppDirN = $pp.Dir.TrimEnd('\')
+            $owned = New-Object System.Collections.Generic.List[string]   # paths relative to $ppDirN
+            foreach ($ri in (Get-ChildItem -Path $ppDirN -Recurse -File -Filter *.r -ErrorAction SilentlyContinue)) {
+                $full = $ri.FullName
+                $fl = $full.ToLower()
+                if ($claimed.ContainsKey($fl)) { continue }        # already owned by a deeper entry
+                $claimed[$fl] = $true
+                $owned.Add($full.Substring($ppDirN.Length).TrimStart('\'))   # relative to THIS .pl's dir
             }
-            if ($LASTEXITCODE -ne 0 -and $plOk) { $plOk = $false; $plErr = ("prolib exit {0}: {1}" -f $LASTEXITCODE, $plOut.Trim()) }
-            if (-not $plOk) { break }
-        }
-        if (-not $plOk -or -not (Test-Path -Path $plBuild -PathType Leaf)) {
-            Write-Message ("  Package: prolib failed to build {0} ({1}) - aborting (fail closed)." -f $plName, $plErr) -Fore Red
-            Write-Message ("    (staging kept for review: {0})" -f $staging) -Fore DarkGray
+            if ($owned.Count -eq 0) { continue }                   # skip empties
+
+            $plName  = $pp.PlName
+            $plStage = Join-PathX $staging $plName                 # ZIP root
+            $plBuild = Join-PathX $ppDirN $plName                  # built in-place in the PROPATH dir, then moved
             if (Test-Path -Path $plBuild) { Remove-Item -Path $plBuild -Force -ErrorAction SilentlyContinue }
+
+            Write-Message ("  -ShipPL: building {0} from {1} r-code file(s) under {2}..." -f $plName, $owned.Count, $(if ($pp.Rel -eq "") { "<root>" } else { $pp.Rel })) -Fore Cyan
+            # Run prolib with CWD = THIS PROPATH dir so members store relative to it.
+            # -create precedes -add; add in batches to stay under the OS cmd-line limit.
+            $plOk = $true; $plErr = ""
+            $created = $false
+            $batchSize = 200
+            $ownedArr = @($owned)
+            for ($bi = 0; $bi -lt $ownedArr.Count; $bi += $batchSize) {
+                $batch = $ownedArr[$bi..([Math]::Min($bi + $batchSize - 1, $ownedArr.Count - 1))]
+                $plArgs = New-Object System.Collections.Generic.List[string]
+                $plArgs.Add($plName)                               # library-name (relative to CWD=$ppDirN)
+                if (-not $created) { $plArgs.Add("-create"); $created = $true }
+                $plArgs.Add("-nowarn"); $plArgs.Add("-add")
+                foreach ($rp in $batch) { $plArgs.Add($rp) }
+                $plOut = ""
+                try {
+                    Push-Location -Path $ppDirN
+                    $plOut = (& $prolib @plArgs 2>&1 | ForEach-Object { "$_" }) -join "`n"
+                } catch {
+                    $plOk = $false; $plErr = $_.Exception.Message
+                } finally {
+                    Pop-Location
+                }
+                if ($LASTEXITCODE -ne 0 -and $plOk) { $plOk = $false; $plErr = ("prolib exit {0}: {1}" -f $LASTEXITCODE, $plOut.Trim()) }
+                if (-not $plOk) { break }
+            }
+            if (-not $plOk -or -not (Test-Path -Path $plBuild -PathType Leaf)) {
+                Write-Message ("  Package: prolib failed to build {0} ({1}) - aborting (fail closed)." -f $plName, $plErr) -Fore Red
+                Write-Message ("    (staging kept for review: {0})" -f $staging) -Fore DarkGray
+                if (Test-Path -Path $plBuild) { Remove-Item -Path $plBuild -Force -ErrorAction SilentlyContinue }
+                $script:OnError = $true; return
+            }
+            Move-Item -Path $plBuild -Destination $plStage -Force
+            $plInfoList += [PSCustomObject]@{
+                name   = $plName
+                dir    = $(if ($pp.Rel -eq "") { "." } else { $pp.Rel })   # app-root-relative PROPATH dir
+                sha256 = (Get-FileHash -Path $plStage -Algorithm SHA256).Hash
+                bytes  = (Get-Item -Path $plStage).Length
+                units  = $owned.Count
+            }
+            Write-Message ("  -ShipPL: {0} built ({1} files, {2} bytes)" -f $plName, $owned.Count, (Get-Item -Path $plStage).Length) -Fore Green
+        }
+        if ($plInfoList.Count -eq 0) {
+            Write-Message "  Package: -ShipPL produced no libraries (no PROPATH entry under the compile root held r-code) - aborting (fail closed)." -Fore Red
+            Write-Message ("    (staging kept for review: {0})" -f $staging) -Fore DarkGray
             $script:OnError = $true; return
         }
-        # Move the finished library to the ZIP root; record hash/size for the manifest.
-        Move-Item -Path $plBuild -Destination $plStage -Force
-        $plInfo = [PSCustomObject]@{
-            name   = $plName
-            sha256 = (Get-FileHash -Path $plStage -Algorithm SHA256).Hash
-            bytes  = (Get-Item -Path $plStage).Length
-            units  = $plRelPaths.Count
-        }
-        Write-Message ("  -ShipPL: {0} built ({1} units, {2} bytes)" -f $plName, $plInfo.units, $plInfo.bytes) -Fore Green
+        Write-Message ("  -ShipPL: {0} procedure library(ies) built." -f $plInfoList.Count) -Fore Green
     }
 
     $dfNames = @()
@@ -3647,41 +3748,39 @@ function Do-Package {
     $builtStamp  = (Get-Date).ToString("o")
     $builtBy     = $env:USERNAME
     $gitBranchStr= "$gitBranch".Trim()
-    $compiledAgainst = New-Object PSObject
-    Add-Member -InputObject $compiledAgainst -NotePropertyName app    -NotePropertyValue $Item.App
-    Add-Member -InputObject $compiledAgainst -NotePropertyName site   -NotePropertyValue $Item.Site
-    Add-Member -InputObject $compiledAgainst -NotePropertyName env    -NotePropertyValue $Item.Env
-    Add-Member -InputObject $compiledAgainst -NotePropertyName server -NotePropertyValue $Item.Server
-    $markerDrift = New-Object PSObject
-    Add-Member -InputObject $markerDrift -NotePropertyName markerNoGit -NotePropertyValue $markerNoGit
-    Add-Member -InputObject $markerDrift -NotePropertyName gitNoMarker -NotePropertyValue $gitNoMarker
-    $manifestObj = New-Object PSObject
-    Add-Member -InputObject $manifestObj -NotePropertyName project         -NotePropertyValue $projTok
-    Add-Member -InputObject $manifestObj -NotePropertyName stamp           -NotePropertyValue $builtStamp
-    Add-Member -InputObject $manifestObj -NotePropertyName author          -NotePropertyValue $builtBy
-    Add-Member -InputObject $manifestObj -NotePropertyName oeVersion       -NotePropertyValue $Item.OEVersion
-    Add-Member -InputObject $manifestObj -NotePropertyName compiledAgainst -NotePropertyValue $compiledAgainst
-    Add-Member -InputObject $manifestObj -NotePropertyName full            -NotePropertyValue ([bool]$Full)
-    Add-Member -InputObject $manifestObj -NotePropertyName mode            -NotePropertyValue $(if ($Full -eq $true) { "full" } else { "changes" })
-    Add-Member -InputObject $manifestObj -NotePropertyName gitBranch       -NotePropertyValue $gitBranchStr
-    Add-Member -InputObject $manifestObj -NotePropertyName gitCommits      -NotePropertyValue @($gitCommits)
-    Add-Member -InputObject $manifestObj -NotePropertyName deltaDf         -NotePropertyValue @($dfNames)
-    # changedSource/rcode are arrays of PSCustomObject.  Add-Member -NotePropertyValue
-    # mis-binds an array-of-objects in Windows PowerShell 5.1 ("Argument types do not
-    # match"), so attach these two via the .NET PSNoteProperty API, which takes a plain
-    # object value and never enumerates/mis-binds the array.
-    $manifestObj.PSObject.Properties.Add((New-Object System.Management.Automation.PSNoteProperty('changedSource', [object[]]@($changedManifest))))
-    $manifestObj.PSObject.Properties.Add((New-Object System.Management.Automation.PSNoteProperty('rcode',         [object[]]@($rcodeManifest))))
-    # shipPL is a single object (or $null when -ShipPL was not used); Add-Member
-    # binds a scalar object fine (the array mis-bind only hits arrays-of-objects).
-    Add-Member -InputObject $manifestObj -NotePropertyName shipPL          -NotePropertyValue $plInfo
-    Add-Member -InputObject $manifestObj -NotePropertyName markerDrift     -NotePropertyValue $markerDrift
-    $deployNotesText = if ($plInfo) {
-        "PL mode (-ShipPL): deploy.ps1 backs up + replaces ONLY $($plInfo.name) at TargetRoot. source/ and rcode/ ride along as documentation and are NOT deployed. Load any df/ deltas FIRST (DBA-run, in listed order). Dry-run by default; use -Execute."
+    $deployNotesText = if ($plInfoList.Count -gt 0) {
+        $plNamesJoined = (@($plInfoList | ForEach-Object { $_.name }) -join ', ')
+        "PL mode (-ShipPL): deploy.ps1 backs up + replaces ONLY the procedure library file(s) [$plNamesJoined] at TargetRoot (one per PROPATH entry). source/ and rcode/ ride along as documentation and are NOT deployed. Load any df/ deltas FIRST (DBA-run, in listed order). Dry-run by default; use -Execute."
     } else {
         "Load any df/ deltas FIRST (DBA-run, in listed order), then r-code + source. deploy.ps1 is dry-run by default; use -Execute."
     }
-    Add-Member -InputObject $manifestObj -NotePropertyName deployNotes     -NotePropertyValue $deployNotesText
+    # Build the manifest as an ORDERED HASHTABLE and serialize it straight to JSON.
+    # This sidesteps two Windows PowerShell 5.1 traps that bit earlier approaches:
+    #   * Add-Member -NotePropertyValue <array-of-objects> throws "Argument types do
+    #     not match" (parameter-set ambiguity on the array value).
+    #   * $obj.PSObject.Properties.Add((New-Object PSNoteProperty ...)) throws the
+    #     same on some 5.1 builds (Add() overload resolution on the note-property).
+    # ConvertTo-Json serializes an [ordered] hashtable - including nested hashtables
+    # and object arrays (List[object] of PSCustomObject) - natively, with no
+    # Add-Member / PSObject.Properties calls at all.  (Do NOT cast the [ordered] to
+    # [PSCustomObject]; THAT cast is what silently produced an empty object in 5.1.)
+    $manifestObj = [ordered]@{
+        project         = $projTok
+        stamp           = $builtStamp
+        author          = $builtBy
+        oeVersion       = $Item.OEVersion
+        compiledAgainst = [ordered]@{ app = $Item.App; site = $Item.Site; env = $Item.Env; server = $Item.Server }
+        full            = [bool]$Full
+        mode            = $(if ($Full -eq $true) { "full" } else { "changes" })
+        gitBranch       = $gitBranchStr
+        gitCommits      = @($gitCommits)
+        deltaDf         = @($dfNames)
+        changedSource   = @($changedManifest)
+        rcode           = @($rcodeManifest)
+        shipPL          = @($plInfoList)
+        markerDrift     = [ordered]@{ markerNoGit = $markerNoGit; gitNoMarker = $gitNoMarker }
+        deployNotes     = $deployNotesText
+    }
     Set-Content -Path (Join-PathX $staging "manifest.json") -Value ($manifestObj | ConvertTo-Json -Depth 8) -Encoding ascii
 
     # Human-readable manifest.txt
@@ -3701,9 +3800,9 @@ function Do-Package {
     $mt.Add("R-code shipped ($($rcodeManifest.Count)):")
     foreach ($r in $rcodeManifest) { $mt.Add(("  {0}  {1} bytes  sha256 {2}" -f $r.path, $r.bytes, $r.sha256)) }
     $mt.Add("")
-    if ($plInfo) {
-        $mt.Add("Procedure library (-ShipPL) - the ONLY file deploy.ps1 backs up/replaces:")
-        $mt.Add(("  {0}  {1} bytes  {2} unit(s)  sha256 {3}" -f $plInfo.name, $plInfo.bytes, $plInfo.units, $plInfo.sha256))
+    if ($plInfoList.Count -gt 0) {
+        $mt.Add("Procedure libraries (-ShipPL) - the ONLY files deploy.ps1 backs up/replaces (one per PROPATH entry):")
+        foreach ($pl in $plInfoList) { $mt.Add(("  {0}  (PROPATH dir {1})  {2} bytes  {3} file(s)  sha256 {4}" -f $pl.name, $pl.dir, $pl.bytes, $pl.units, $pl.sha256)) }
         $mt.Add("")
     }
     if ($markerNoGit.Count -or $gitNoMarker.Count) {
@@ -3852,15 +3951,19 @@ function Deploy-OneFile(`$srcFile, `$rel) {
   }
 }
 
-`$plName = if (`$manifest.shipPL) { "`$(`$manifest.shipPL.name)" } else { "" }
-if (-not [string]::IsNullOrWhiteSpace(`$plName)) {
-  # PL mode: the ONLY file deployed is the <App>.pl at the bundle root.
-  Say "" ; Say "PL mode: the single procedure library `$plName is the only file deployed (source\ + rcode\ are documentation only)." Cyan
-  `$plSrc = Join-Path `$here `$plName
-  if (-not (Test-Path `$plSrc)) {
-    Say "ERROR: manifest says shipPL=`$plName but that file is not at the bundle root. Rebuild the package." Red; exit 1
+`$pls = @(`$manifest.shipPL | Where-Object { `$_ -and `$_.name })
+if (`$pls.Count -gt 0) {
+  # PL mode: the ONLY files deployed are the procedure libraries at the bundle root
+  # (one per PROPATH entry).  Each <name>.pl lands flat at TargetRoot\<name>; the
+  # site INI's PROPATH lists them in search order.  source\ + rcode\ are docs only.
+  Say "" ; Say ("PL mode: {0} procedure library(ies) are the only files deployed (source\ + rcode\ are documentation only)." -f `$pls.Count) Cyan
+  foreach (`$pl in `$pls) {
+    `$plSrc = Join-Path `$here `$pl.name
+    if (-not (Test-Path `$plSrc)) {
+      Say ("ERROR: manifest lists shipPL {0} but that file is not at the bundle root. Rebuild the package." -f `$pl.name) Red; exit 1
+    }
+    if (Deploy-OneFile `$plSrc `$pl.name) { `$changed++ } else { `$errors++ }
   }
-  if (Deploy-OneFile `$plSrc `$plName) { `$changed++ } else { `$errors++ }
 } else {
   # Loose-file mode: mirror source\ + rcode\ onto TargetRoot.
   foreach (`$sub in @('source','rcode')) {
@@ -4991,8 +5094,8 @@ function Invoke-Menu {
                 $script:DfLoadedConfirmed = Read-YesNo -Prompt "  Confirm these delta DF(s) are ALREADY LOADED into the compile DB (required to trust the r-code CRC)?" -Default:$false
             }
 
-            # -ShipPL: bundle an <App>.pl (deploy backs up/replaces just that one file).
-            $script:ShipPL = Read-YesNo -Prompt "Also build an <App>.pl procedure library (deploy replaces ONLY the .pl)?" -Default:$false
+            # -ShipPL: per-PROPATH procedure libraries (implies -Full; deploy replaces just the .pl files).
+            $script:ShipPL = Read-YesNo -Prompt "Build per-PROPATH procedure libraries (.pl; implies -Full; deploy replaces ONLY the .pl files)?" -Default:$false
 
             & $askIniPfOverride
 

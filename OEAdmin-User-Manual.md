@@ -567,23 +567,33 @@ compile DB (so the r-code CRC can be trusted): pass **`-DfLoadedConfirmed`**
 
 **The bundle + `deploy.ps1`.** The zip (`packages/<project>_<stamp>.zip`) holds
 `source/`, `rcode/`, `df/`, `manifest.json`, `manifest.txt`, and `deploy.ps1`
-(plus `<App>.pl` at the root with `-ShipPL`).
+(plus one or more `.pl` procedure libraries at the root with `-ShipPL`).
 `deploy.ps1` (run on the target server) is **safe by default**: dry-run unless
 `-Execute`, requires `-TargetRoot <app root>`, backs up each file (verified)
 before overwrite, prints/awaits the DF load, and supports `-Rollback -Stamp
 <set>`.
 
-**Procedure library (`-ShipPL`).** `-ShipPL` bundles the shipped r-code into one
-`<App>.pl` (e.g. `App1.pl`) at the zip root — a single file for production to
-verify and deploy instead of a tree of loose `.r`. It is built with the OpenEdge
-`prolib` utility from the **same fresh full compile** that drives the XREF scan.
-Because a procedure library stores the pathname each member is added with,
-OEAdmin runs `prolib` with its working directory at the app source root and adds
-each unit by its app-root-relative path, so the r-code resolves on the production
-`PROPATH`. `source/` and `rcode/` still ship as documentation, but the generated
-`deploy.ps1` backs up + replaces **only** the `<App>.pl`; `-Rollback` restores the
-prior one. Opt-in; without it the deploy writes the loose `source/` + `rcode/`
-trees. Fail-closed: if `prolib` is missing or errors, the package aborts.
+**Procedure libraries (`-ShipPL`).** `-ShipPL` bundles the compiled r-code into
+**procedure libraries — one `.pl` per PROPATH entry** under the compile root — at
+the zip root, so production can **override code via PROPATH**. This matters because
+r-code inside a `.pl` resolves **relative to where the `.pl` sits on PROPATH**, so
+each PROPATH directory needs its own library. `-ShipPL` **implies `-Full`**. It is
+built with the OpenEdge `prolib` utility from the **same fresh full compile** that
+drives the XREF scan.
+
+OEAdmin reads the `PROPATH=` line from the **same site INI the compile used** and
+keeps every entry at/under the compile root. Each becomes one library, named after
+its path relative to the compile root (the root itself → `<App>.pl`;
+`app2mods/sub` → `app2mods-sub.pl`, separators become `-`). Each library is built
+by running `prolib` **from its own directory**, adding members **relative to that
+directory**, so the r-code resolves on the server PROPATH. An `.r` is owned by the
+**nearest (deepest)** PROPATH entry, so nested entries don't duplicate; a PROPATH
+directory with no r-code is skipped. The site INI lists the `.pl` files on PROPATH
+in search order (you maintain the INI). `source/` and `rcode/` still ship as
+documentation, but the generated `deploy.ps1` backs up + replaces **only** those
+`.pl` file(s); `-Rollback` restores them. Opt-in; without it the deploy writes the
+loose `source/` + `rcode/` trees. Fail-closed: if `prolib` is missing, any library
+errors, or no PROPATH entry under the compile root holds r-code, the package aborts.
 
 ```bash
 # Pass 1 - resolve + review (commit-message search), no build
@@ -598,8 +608,8 @@ trees. Fail-closed: if `prolib` is missing or errors, the package aborts.
 # Ship the whole tree's r-code (DB/CRC-wide change)
 ./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace feature-x -Accept -Project FullRelease -Full
 
-# Also bundle one App1.pl (deploy backs up/replaces ONLY the .pl)
-./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace feature-x -Grep "TICKET-123" -Accept -Project TICKET-123 -ShipPL
+# Build per-PROPATH .pl libraries (implies -Full; deploy backs up/replaces ONLY the .pl files)
+./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace feature-x -Accept -Project TICKET-123 -ShipPL
 ```
 
 Then on the target server, from the unzipped bundle:
