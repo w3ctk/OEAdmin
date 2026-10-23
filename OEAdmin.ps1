@@ -3563,8 +3563,12 @@ function Do-Package {
     Add-Member -InputObject $manifestObj -NotePropertyName gitBranch       -NotePropertyValue $gitBranchStr
     Add-Member -InputObject $manifestObj -NotePropertyName gitCommits      -NotePropertyValue @($gitCommits)
     Add-Member -InputObject $manifestObj -NotePropertyName deltaDf         -NotePropertyValue @($dfNames)
-    Add-Member -InputObject $manifestObj -NotePropertyName changedSource   -NotePropertyValue @($changedManifest)
-    Add-Member -InputObject $manifestObj -NotePropertyName rcode           -NotePropertyValue @($rcodeManifest)
+    # changedSource/rcode are arrays of PSCustomObject.  Add-Member -NotePropertyValue
+    # mis-binds an array-of-objects in Windows PowerShell 5.1 ("Argument types do not
+    # match"), so attach these two via the .NET PSNoteProperty API, which takes a plain
+    # object value and never enumerates/mis-binds the array.
+    $manifestObj.PSObject.Properties.Add((New-Object System.Management.Automation.PSNoteProperty('changedSource', [object[]]@($changedManifest))))
+    $manifestObj.PSObject.Properties.Add((New-Object System.Management.Automation.PSNoteProperty('rcode',         [object[]]@($rcodeManifest))))
     Add-Member -InputObject $manifestObj -NotePropertyName markerDrift     -NotePropertyValue $markerDrift
     Add-Member -InputObject $manifestObj -NotePropertyName deployNotes     -NotePropertyValue "Load any df/ deltas FIRST (DBA-run, in listed order), then r-code + source. deploy.ps1 is dry-run by default; use -Execute."
     Set-Content -Path (Join-PathX $staging "manifest.json") -Value ($manifestObj | ConvertTo-Json -Depth 8) -Encoding ascii
