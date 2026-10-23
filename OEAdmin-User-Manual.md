@@ -566,11 +566,24 @@ compile DB (so the r-code CRC can be trusted): pass **`-DfLoadedConfirmed`**
 (non-interactive) or answer the prompt. It is **separate** from `-Accept`.
 
 **The bundle + `deploy.ps1`.** The zip (`packages/<project>_<stamp>.zip`) holds
-`source/`, `rcode/`, `df/`, `manifest.json`, `manifest.txt`, and `deploy.ps1`.
+`source/`, `rcode/`, `df/`, `manifest.json`, `manifest.txt`, and `deploy.ps1`
+(plus `<App>.pl` at the root with `-ShipPL`).
 `deploy.ps1` (run on the target server) is **safe by default**: dry-run unless
 `-Execute`, requires `-TargetRoot <app root>`, backs up each file (verified)
 before overwrite, prints/awaits the DF load, and supports `-Rollback -Stamp
 <set>`.
+
+**Procedure library (`-ShipPL`).** `-ShipPL` bundles the shipped r-code into one
+`<App>.pl` (e.g. `App1.pl`) at the zip root — a single file for production to
+verify and deploy instead of a tree of loose `.r`. It is built with the OpenEdge
+`prolib` utility from the **same fresh full compile** that drives the XREF scan.
+Because a procedure library stores the pathname each member is added with,
+OEAdmin runs `prolib` with its working directory at the app source root and adds
+each unit by its app-root-relative path, so the r-code resolves on the production
+`PROPATH`. `source/` and `rcode/` still ship as documentation, but the generated
+`deploy.ps1` backs up + replaces **only** the `<App>.pl`; `-Rollback` restores the
+prior one. Opt-in; without it the deploy writes the loose `source/` + `rcode/`
+trees. Fail-closed: if `prolib` is missing or errors, the package aborts.
 
 ```bash
 # Pass 1 - resolve + review (commit-message search), no build
@@ -584,6 +597,9 @@ before overwrite, prints/awaits the DF load, and supports `-Rollback -Stamp
 
 # Ship the whole tree's r-code (DB/CRC-wide change)
 ./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace feature-x -Accept -Project FullRelease -Full
+
+# Also bundle one App1.pl (deploy backs up/replaces ONLY the .pl)
+./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace feature-x -Grep "TICKET-123" -Accept -Project TICKET-123 -ShipPL
 ```
 
 Then on the target server, from the unzipped bundle:
@@ -884,7 +900,7 @@ Compile: `-Compile` (headless Application Compiler via `OECompiler.p`),
 
 Package (release bundler): `-Package`, `-Project` (required with `-Accept`),
 `-Grep` / `-FromCommit` / `-ToCommit` / `-FileList` (change-set inputs), `-Full`,
-`-Accept`, `-DeltaDf`, `-DfLoadedConfirmed`, `-PackageBackupDir`.
+`-ShipPL`, `-Accept`, `-DeltaDf`, `-DfLoadedConfirmed`, `-PackageBackupDir`.
 
 Test (ABLUnit, OpenEdge 12+): `-Test`, `-TestSpec` (class/proc / `Foo.cls#Method`
 / comma-list / folder; blank = a `tests` folder), `-TestDir`, `-TestResults`.

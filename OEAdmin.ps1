@@ -1,6 +1,6 @@
 <#PSScriptInfo
 
-.VERSION 1.5.0
+.VERSION 1.6.0
 
 .AUTHOR
 
@@ -110,6 +110,18 @@ You may obtain a copy of the License at
         prints a pass/fail summary.  Any failure/error - or a missing results.xml
         (usually the framework not on PROPATH) - sets OnTestError and exit 2004.
         OpenEdge 12+ ONLY (9.1E/10.2B targets are refused).  Wired into -Menu.
+
+1.6.0 - -Package gains -ShipPL: after the fresh full compile, bundle the shipped
+        r-code set into ONE <App>.pl procedure library at the ZIP root, built with
+        prolib from the SAME compile that drives the XREF dependency scan.  The
+        library is created with its working directory at the app source root and
+        members added by app-root-relative path, so the r-code resolves on the
+        production PROPATH.  source/ and rcode/ still ride along as documentation,
+        but the shipped deploy.ps1 then backs up + replaces ONLY that single
+        <App>.pl on the server (one file to verify instead of a tree of loose .r);
+        -Rollback restores the prior .pl.  The manifest records the .pl name, size,
+        sha256 and unit count.  Opt-in; absent = the loose source+rcode deploy.
+        Wired into -Menu / help / docs.
 
 #>
 
@@ -235,7 +247,10 @@ ACTIONS:
                  review the change set, then -Accept -Project <tok> re-hashes it and
                  HARD-STOPS on drift before building.  deploy.ps1 is dry-run by
                  default (-Execute to apply), backs up before overwrite, -Rollback
-                 restores.  LOCAL worktree only (-Remote refused).
+                 restores.  -ShipPL also bundles ONE <App>.pl (procedure library)
+                 at the zip root from the shipped r-code; deploy.ps1 then backs up +
+                 replaces only that single .pl on the server (source/rcode stay as
+                 documentation).  LOCAL worktree only (-Remote refused).
     -Test        Run the ABLUnit suite headlessly via the Progress driver
                  ABLUnitCore.p (resolved off the environment's INI PROPATH).  Same
                  launch machinery as -Compile/-Batch.  -TestSpec picks what to run
@@ -333,6 +348,9 @@ Usage examples (all switches shown; App/Site/Env names are placeholders):
 
     # ...ship the WHOLE source tree's r-code (DB/CRC-wide change)
     ./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace feature-x -Accept -Project FullRelease -Full
+
+    # ...also bundle a single App1.pl (deploy backs up/replaces ONLY the .pl)
+    ./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace feature-x -Grep "TICKET-123" -Accept -Project TICKET-123 -ShipPL
 
     # ...preview the whole run (resolve + compile launch) without building
     ./OEAdmin.ps1 -Package -App App1 -Site S1 -Env Test -Workspace feature-x -Grep "TICKET-123" -Accept -Project TICKET-123 -DryRun
@@ -727,6 +745,13 @@ param (
     # for review.  -Full ships the WHOLE source tree's r-code (DB/CRC-wide change).
     [switch]$Accept,
     [switch]$Full,
+
+    # -ShipPL: also build an <App>.pl procedure library from the shipped r-code and
+    # place it at the ZIP root.  source\ and rcode\ still ride along as documentation,
+    # but the shipped deploy.ps1 then backs up + replaces ONLY that single <App>.pl
+    # on the server (one file to verify).  Built with prolib from the SAME fresh full
+    # compile that drives the XREF dependency scan.
+    [switch]$ShipPL,
 
     # -DeltaDf: schema-delta .df file(s) (comma list) to carry in the bundle; the
     # generated deploy.ps1 PRINTS the DBA load steps and awaits them (never auto-
@@ -2115,7 +2140,11 @@ function Invoke-Git {
     $display = "git " + ($Arguments -join ' ')
     if ($DryRun -eq $true) { Write-Message ("  [DRYRUN] {0}" -f $display) -Fore DarkGray; return $true }
     try {
-        $out = & git @Arguments 2>&1 | Out-String; $code = $LASTEXITCODE
+        # git writes its "From <url>" banner and "<old>..<new> -> origin/<branch>"
+        # ref-update lines to STDERR; merging with 2>&1 turns each into an
+        # ErrorRecord the host renders as a red NativeCommandError even on exit 0.
+        # Coerce every item to a plain string so stderr is captured as text.
+        $out = (& git @Arguments 2>&1 | ForEach-Object { "$_" }) -join "`n"; $code = $LASTEXITCODE
     } catch {
         Write-Message ("  {0}: git error: {1}" -f $Label, $_.Exception.Message) -Fore Red; $script:OnError = $true; return $false
     }
@@ -3466,6 +3495,7 @@ function Do-Package {
         foreach ($f in $changed)  { Write-Message ("    source  {0}" -f $f) -Fore DarkGray }
         foreach ($u in $rcodeSet) { Write-Message ("    rcode   {0}.r" -f $u) -Fore DarkGray }
         foreach ($d in $dfFiles)  { Write-Message ("    df      {0}" -f (Split-Path $d -Leaf)) -Fore DarkGray }
+        if ($ShipPL -eq $true) { Write-Message ("    pl      {0}.pl  (from the {1} r-code unit(s) above; deploy backs up/replaces ONLY this file)" -f $Item.App, $rcodeSet.Count) -Fore DarkGray }
         Write-Message ("  [DRYRUN] would write: {0}" -f $zipPath) -Fore DarkGray
         Remove-Item -Path $staging -Recurse -Force -ErrorAction SilentlyContinue
         return
@@ -3515,6 +3545,79 @@ function Do-Package {
         $null = New-Item -ItemType Directory -Path (Split-Path $dest -Parent) -Force -ErrorAction SilentlyContinue
         Copy-Item -Path $rFull -Destination $dest -Force
         $rcodeManifest.Add([PSCustomObject]@{ path=($rBase + ".r"); sha256=(Get-FileHash -Path $rFull -Algorithm SHA256).Hash; bytes=(Get-Item -Path $rFull).Length })
+    }
+
+    # ---- Optional <App>.pl procedure library (-ShipPL) ------------------------
+    # Bundle the SAME r-code ship set into one <App>.pl at the ZIP root so prod has
+    # a single file to verify/deploy.  prolib stores whatever pathname it is given
+    # in the library's table of contents, so the entries MUST be app-root-relative
+    # (e.g. Bin\foo.r) for the r-code to resolve on the PROPATH at runtime; that
+    # means running prolib with its WORKING DIRECTORY set to $srcRoot and adding
+    # each unit by its relative path.  r-code lives beside source under $srcRoot
+    # (COMPILE ... SAVE), already confirmed present by the loop above.
+    $plInfo = $null
+    if ($ShipPL -eq $true) {
+        $plName  = "$($Item.App).pl"                       # e.g. App1.pl
+        $plStage = Join-PathX $staging $plName             # final resting place (ZIP root)
+        $plBuild = Join-PathX $srcRoot $plName             # built in-place at $srcRoot, then moved
+        $prolib  = Get-OEToolPath $Item.DLC "prolib"       # <DLC>/bin/prolib[.bat] (platform-aware)
+        if (-not (Test-Path -Path $prolib -PathType Leaf)) {
+            Write-Message ("  Package: prolib not found for -ShipPL: {0}" -f $prolib) -Fore Red
+            Write-Message ("    (staging kept for review: {0})" -f $staging) -Fore DarkGray
+            $script:OnError = $true; return
+        }
+        # The relative .r paths to add (backslash form, as stored in the TOC).
+        $plRelPaths = @($rcodeSet | ForEach-Object { (($_ -replace '\.(p|w|cls|t)$','') -replace '/','\') + ".r" })
+        if ($plRelPaths.Count -eq 0) {
+            Write-Message "  Package: -ShipPL requested but the r-code ship set is empty; nothing to put in the .pl - aborting (fail closed)." -Fore Red
+            Write-Message ("    (staging kept for review: {0})" -f $staging) -Fore DarkGray
+            $script:OnError = $true; return
+        }
+        # Start clean: an existing stale .pl at $srcRoot would be appended to.
+        if (Test-Path -Path $plBuild) { Remove-Item -Path $plBuild -Force -ErrorAction SilentlyContinue }
+
+        Write-Message ("  -ShipPL: building {0} from {1} r-code unit(s) via prolib..." -f $plName, $plRelPaths.Count) -Fore Cyan
+        # Run prolib with CWD=$srcRoot.  -create must precede -add (PROLIB processes
+        # left-to-right and aborts on first error).  Add in batches so the command
+        # line stays well under the OS limit on large (-Full) sets.  -nowarn makes a
+        # re-added member replace rather than error.
+        $plOk = $true; $plErr = ""
+        $created = $false
+        $batchSize = 200
+        for ($bi = 0; $bi -lt $plRelPaths.Count; $bi += $batchSize) {
+            $batch = $plRelPaths[$bi..([Math]::Min($bi + $batchSize - 1, $plRelPaths.Count - 1))]
+            $plArgs = New-Object System.Collections.Generic.List[string]
+            $plArgs.Add($plName)                            # library-name (relative to CWD=$srcRoot)
+            if (-not $created) { $plArgs.Add("-create"); $created = $true }
+            $plArgs.Add("-nowarn"); $plArgs.Add("-add")
+            foreach ($rp in $batch) { $plArgs.Add($rp) }
+            $plOut = ""
+            try {
+                Push-Location -Path $srcRoot
+                $plOut = (& $prolib @plArgs 2>&1 | ForEach-Object { "$_" }) -join "`n"
+            } catch {
+                $plOk = $false; $plErr = $_.Exception.Message
+            } finally {
+                Pop-Location
+            }
+            if ($LASTEXITCODE -ne 0 -and $plOk) { $plOk = $false; $plErr = ("prolib exit {0}: {1}" -f $LASTEXITCODE, $plOut.Trim()) }
+            if (-not $plOk) { break }
+        }
+        if (-not $plOk -or -not (Test-Path -Path $plBuild -PathType Leaf)) {
+            Write-Message ("  Package: prolib failed to build {0} ({1}) - aborting (fail closed)." -f $plName, $plErr) -Fore Red
+            Write-Message ("    (staging kept for review: {0})" -f $staging) -Fore DarkGray
+            if (Test-Path -Path $plBuild) { Remove-Item -Path $plBuild -Force -ErrorAction SilentlyContinue }
+            $script:OnError = $true; return
+        }
+        # Move the finished library to the ZIP root; record hash/size for the manifest.
+        Move-Item -Path $plBuild -Destination $plStage -Force
+        $plInfo = [PSCustomObject]@{
+            name   = $plName
+            sha256 = (Get-FileHash -Path $plStage -Algorithm SHA256).Hash
+            bytes  = (Get-Item -Path $plStage).Length
+            units  = $plRelPaths.Count
+        }
+        Write-Message ("  -ShipPL: {0} built ({1} units, {2} bytes)" -f $plName, $plInfo.units, $plInfo.bytes) -Fore Green
     }
 
     $dfNames = @()
@@ -3569,8 +3672,16 @@ function Do-Package {
     # object value and never enumerates/mis-binds the array.
     $manifestObj.PSObject.Properties.Add((New-Object System.Management.Automation.PSNoteProperty('changedSource', [object[]]@($changedManifest))))
     $manifestObj.PSObject.Properties.Add((New-Object System.Management.Automation.PSNoteProperty('rcode',         [object[]]@($rcodeManifest))))
+    # shipPL is a single object (or $null when -ShipPL was not used); Add-Member
+    # binds a scalar object fine (the array mis-bind only hits arrays-of-objects).
+    Add-Member -InputObject $manifestObj -NotePropertyName shipPL          -NotePropertyValue $plInfo
     Add-Member -InputObject $manifestObj -NotePropertyName markerDrift     -NotePropertyValue $markerDrift
-    Add-Member -InputObject $manifestObj -NotePropertyName deployNotes     -NotePropertyValue "Load any df/ deltas FIRST (DBA-run, in listed order), then r-code + source. deploy.ps1 is dry-run by default; use -Execute."
+    $deployNotesText = if ($plInfo) {
+        "PL mode (-ShipPL): deploy.ps1 backs up + replaces ONLY $($plInfo.name) at TargetRoot. source/ and rcode/ ride along as documentation and are NOT deployed. Load any df/ deltas FIRST (DBA-run, in listed order). Dry-run by default; use -Execute."
+    } else {
+        "Load any df/ deltas FIRST (DBA-run, in listed order), then r-code + source. deploy.ps1 is dry-run by default; use -Execute."
+    }
+    Add-Member -InputObject $manifestObj -NotePropertyName deployNotes     -NotePropertyValue $deployNotesText
     Set-Content -Path (Join-PathX $staging "manifest.json") -Value ($manifestObj | ConvertTo-Json -Depth 8) -Encoding ascii
 
     # Human-readable manifest.txt
@@ -3590,6 +3701,11 @@ function Do-Package {
     $mt.Add("R-code shipped ($($rcodeManifest.Count)):")
     foreach ($r in $rcodeManifest) { $mt.Add(("  {0}  {1} bytes  sha256 {2}" -f $r.path, $r.bytes, $r.sha256)) }
     $mt.Add("")
+    if ($plInfo) {
+        $mt.Add("Procedure library (-ShipPL) - the ONLY file deploy.ps1 backs up/replaces:")
+        $mt.Add(("  {0}  {1} bytes  {2} unit(s)  sha256 {3}" -f $plInfo.name, $plInfo.bytes, $plInfo.units, $plInfo.sha256))
+        $mt.Add("")
+    }
     if ($markerNoGit.Count -or $gitNoMarker.Count) {
         $mt.Add("Marker drift (advisory):")
         foreach ($f in $markerNoGit) { $mt.Add("  marker-no-git : $f") }
@@ -3703,30 +3819,58 @@ if (`$dfs.Count -gt 0) {
   }
 }
 
-# ---- Code swap (source\ + rcode\), backup-before-overwrite ----------------
+# ---- Code swap, backup-before-overwrite -----------------------------------
+# What gets deployed depends on how the bundle was built:
+#   * PL mode (manifest.shipPL present, from -ShipPL): deploy ONLY the single
+#     <App>.pl at the ZIP root - back it up, then replace it.  source\ and rcode\
+#     stay in the bundle as documentation and are deliberately NOT written out.
+#   * otherwise: the loose source\ + rcode\ trees are mirrored onto TargetRoot.
+# Either way the backup-before-overwrite + -Rollback mechanics are identical, so
+# a PL deploy rolls back to exactly the prior <App>.pl.
 `$backupSet = Join-Path (Join-Path `$PackageBackupDir 'oeadmin-deploy') `$deployStamp
 `$changed = 0; `$errors = 0
-foreach (`$sub in @('source','rcode')) {
-  `$base = Join-Path `$here `$sub
-  if (-not (Test-Path `$base)) { continue }
-  Get-ChildItem -Path `$base -Recurse -File | ForEach-Object {
-    `$rel = `$_.FullName.Substring(`$base.Length).TrimStart('\','/')
-    `$tgt = Join-Path `$TargetRoot `$rel
-    if (`$Execute) {
-      if (Test-Path `$tgt) {
-        `$bkp = Join-Path `$backupSet `$rel
-        `$null = New-Item -ItemType Directory -Path (Split-Path `$bkp -Parent) -Force
-        Copy-Item -Path `$tgt -Destination `$bkp -Force
-        if (-not (Test-Path `$bkp) -or (Get-Item `$bkp).Length -ne (Get-Item `$tgt).Length) {
-          Say "  ERROR: backup verify failed for `$rel - NOT overwriting." Red; `$errors++; return
-        }
+
+# Local helper: back up (verify) then overwrite one file.  Returns `$true on a
+# successful (or previewed) deploy, `$false if the backup verify failed.
+function Deploy-OneFile(`$srcFile, `$rel) {
+  `$tgt = Join-Path `$TargetRoot `$rel
+  if (`$Execute) {
+    if (Test-Path `$tgt) {
+      `$bkp = Join-Path `$backupSet `$rel
+      `$null = New-Item -ItemType Directory -Path (Split-Path `$bkp -Parent) -Force
+      Copy-Item -Path `$tgt -Destination `$bkp -Force
+      if (-not (Test-Path `$bkp) -or (Get-Item `$bkp).Length -ne (Get-Item `$tgt).Length) {
+        Say "  ERROR: backup verify failed for `$rel - NOT overwriting." Red; return `$false
       }
-      `$null = New-Item -ItemType Directory -Path (Split-Path `$tgt -Parent) -Force
-      Copy-Item -Path `$_.FullName -Destination `$tgt -Force
-      Say "  deployed `$sub\`$rel" Green; `$changed++
-    } else {
-      `$act = if (Test-Path `$tgt) { 'replace (backup first)' } else { 'create' }
-      Say "  [PREVIEW] would `$act : `$rel  -> `$tgt" DarkGray
+    }
+    `$null = New-Item -ItemType Directory -Path (Split-Path `$tgt -Parent) -Force
+    Copy-Item -Path `$srcFile -Destination `$tgt -Force
+    Say "  deployed `$rel" Green; return `$true
+  } else {
+    `$act = if (Test-Path `$tgt) { 'replace (backup first)' } else { 'create' }
+    Say "  [PREVIEW] would `$act : `$rel  -> `$tgt" DarkGray; return `$true
+  }
+}
+
+`$plName = if (`$manifest.shipPL) { "`$(`$manifest.shipPL.name)" } else { "" }
+if (-not [string]::IsNullOrWhiteSpace(`$plName)) {
+  # PL mode: the ONLY file deployed is the <App>.pl at the bundle root.
+  Say "" ; Say "PL mode: the single procedure library `$plName is the only file deployed (source\ + rcode\ are documentation only)." Cyan
+  `$plSrc = Join-Path `$here `$plName
+  if (-not (Test-Path `$plSrc)) {
+    Say "ERROR: manifest says shipPL=`$plName but that file is not at the bundle root. Rebuild the package." Red; exit 1
+  }
+  if (Deploy-OneFile `$plSrc `$plName) { `$changed++ } else { `$errors++ }
+} else {
+  # Loose-file mode: mirror source\ + rcode\ onto TargetRoot.
+  foreach (`$sub in @('source','rcode')) {
+    `$base = Join-Path `$here `$sub
+    if (-not (Test-Path `$base)) { continue }
+    Get-ChildItem -Path `$base -Recurse -File | ForEach-Object {
+      # Map to TargetRoot by the app-root-relative path (the sub\ prefix is dropped:
+      # source\Bin\x.p and rcode\Bin\x.r both land under TargetRoot\Bin\).
+      `$appRel = `$_.FullName.Substring(`$base.Length).TrimStart('\','/')
+      if (Deploy-OneFile `$_.FullName `$appRel) { `$changed++ } else { `$errors++ }
     }
   }
 }
@@ -4539,7 +4683,7 @@ function Invoke-Menu {
     $script:Package=$false; $script:Project=""; $script:Grep=""
     $script:FromCommit=""; $script:ToCommit=""; $script:FileList=""
     $script:Accept=$false; $script:DeltaDf=@(); $script:DfLoadedConfirmed=$false
-    $script:Full=$false; $script:PackageBackupDir=""
+    $script:Full=$false; $script:ShipPL=$false; $script:PackageBackupDir=""
     $script:Test=$false; $script:TestSpec=""; $script:TestDir=""; $script:TestResults=""
     $script:AsyncCopy=$false; $script:Dest=""
     $script:Git=$false; $script:UpdateRepos=$false
@@ -4847,6 +4991,9 @@ function Invoke-Menu {
                 $script:DfLoadedConfirmed = Read-YesNo -Prompt "  Confirm these delta DF(s) are ALREADY LOADED into the compile DB (required to trust the r-code CRC)?" -Default:$false
             }
 
+            # -ShipPL: bundle an <App>.pl (deploy backs up/replaces just that one file).
+            $script:ShipPL = Read-YesNo -Prompt "Also build an <App>.pl procedure library (deploy replaces ONLY the .pl)?" -Default:$false
+
             & $askIniPfOverride
 
             # Two-pass gate: resolve-and-review, or accept-and-build now.
@@ -5022,6 +5169,7 @@ function Invoke-Menu {
             }
         }
     }
+    }
 
     # DryRun preview offer (applies to every action).
     $script:DryRun = Read-YesNo -Prompt "Preview only (DryRun, make no changes)?" -Default:$false
@@ -5078,6 +5226,7 @@ function Invoke-Menu {
         if (@($script:DeltaDf).Count -gt 0) { $parts += "-DeltaDf `"$(@($script:DeltaDf) -join ',')`"" }
         if ($script:DfLoadedConfirmed -eq $true) { $parts += "-DfLoadedConfirmed" }
         if ($script:Full -eq $true)              { $parts += "-Full" }
+        if ($script:ShipPL -eq $true)            { $parts += "-ShipPL" }
         if ($script:Accept -eq $true)            { $parts += "-Accept" }
         if (-not [string]::IsNullOrWhiteSpace($script:PackageBackupDir)) { $parts += "-PackageBackupDir `"$($script:PackageBackupDir)`"" }
         if ($script:Installed -eq $true)   { $parts += "-Installed" }
@@ -5262,7 +5411,7 @@ Write-Message "Client action:        Client=$Client Run=$Run Ini='$Ini' Pf='$Pf'
 Write-Message "Batch action:         Batch=$Batch Pgm='$Pgm'" -Fore Blue
 Write-Message "Compile action:       Compile=$Compile FileSpec='$FileSpec' Dir='$Dir' Incremental=$Incremental Listing=$Listing Xref=$Xref XrefXml=$XrefXml Installed=$Installed" -Fore Blue
 Write-Message "Compile excludes:     Exclude='$(@($Exclude) -join ',')' ExcludeFile='$ExcludeFile'" -Fore Blue
-Write-Message "Package action:       Package=$Package Project='$Project' Accept=$Accept Full=$Full DfLoadedConfirmed=$DfLoadedConfirmed" -Fore Blue
+Write-Message "Package action:       Package=$Package Project='$Project' Accept=$Accept Full=$Full ShipPL=$ShipPL DfLoadedConfirmed=$DfLoadedConfirmed" -Fore Blue
 Write-Message "Package change-set:   Grep='$Grep' FromCommit='$FromCommit' ToCommit='$ToCommit' FileList='$FileList' DeltaDf='$(@($DeltaDf) -join ',')'" -Fore Blue
 Write-Message "Test action:          Test=$Test TestSpec='$TestSpec' TestDir='$TestDir' TestResults='$TestResults'" -Fore Blue
 Write-Message "Checks:               CheckAdminServer=$CheckAdminServer CheckPort=$CheckPort CheckLogErrors=$CheckLogErrors RestartOnError=$RestartOnError" -Fore Blue

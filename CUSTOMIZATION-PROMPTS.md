@@ -277,6 +277,13 @@ the required `-Site`/`-Env` — is automatic. Delta schema files passed with
 steps and awaits confirmation; it never loads a `.df` itself, so no DB credentials
 live in the bundle.
 
+`-ShipPL` (optional, nothing to configure) also bundles a single `<App>.pl`
+procedure library at the zip root, built with the OpenEdge `prolib` utility that
+ships with every install (resolved from the target's `DLC`, so no extra setup).
+With it, the generated `deploy.ps1` backs up + replaces only that one `.pl` on the
+server instead of the loose `rcode/` tree — one file to verify. `source/` and
+`rcode/` still ride along as documentation. It is off by default.
+
 ### Topic 15 — Test (`-Test`) — one PROPATH requirement
 
 *(Informational — no interview questions.)* `-Test` runs the **ABLUnit** suite
