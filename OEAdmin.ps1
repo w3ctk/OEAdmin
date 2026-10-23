@@ -3509,41 +3509,49 @@ function Do-Package {
     }
     $gitBranch = (& git -C $srcRoot rev-parse --abbrev-ref HEAD 2>&1 | Select-Object -First 1)
 
-    # Build the manifest as explicit ordered dictionaries and cast at the end.
-    # (A one-shot [PSCustomObject]@{...} literal with nested [PSCustomObject]
-    # literals as values can throw "Argument types do not match" in Windows
-    # PowerShell 5.1; building the maps first and converting is reliable.)
+    # Build the manifest.  A [PSCustomObject]@{...} literal with nested
+    # [PSCustomObject]/List values throws in Windows PowerShell 5.1, and casting an
+    # [ordered] that holds those values can silently yield an EMPTY object (which is
+    # why stamp/author/gitBranch and the JSON came out blank).  The reliable 5.1
+    # pattern is to create a PSObject and Add-Member each property, preserving order.
     $markerNoGit = if ($markers) { @($markers.MarkerNoGit) } else { @() }
     $gitNoMarker = if ($markers) { @($markers.GitNoMarker) } else { @() }
-    $compiledAgainst = [ordered]@{ app=$Item.App; site=$Item.Site; env=$Item.Env; server=$Item.Server }
-    $markerDrift     = [ordered]@{ markerNoGit=$markerNoGit; gitNoMarker=$gitNoMarker }
-    $manifestMap = [ordered]@{
-        project        = $projTok
-        stamp          = (Get-Date).ToString("o")
-        author         = $env:USERNAME
-        oeVersion      = $Item.OEVersion
-        compiledAgainst= [PSCustomObject]$compiledAgainst
-        full           = [bool]$Full
-        mode           = "full"
-        gitBranch      = "$gitBranch".Trim()
-        gitCommits     = @($gitCommits)
-        deltaDf        = @($dfNames)
-        changedSource  = @($changedManifest)
-        rcode          = @($rcodeManifest)
-        markerDrift    = [PSCustomObject]$markerDrift
-        deployNotes    = "Load any df/ deltas FIRST (DBA-run, in listed order), then r-code + source. deploy.ps1 is dry-run by default; use -Execute."
-    }
-    $manifestObj = [PSCustomObject]$manifestMap
+    $builtStamp  = (Get-Date).ToString("o")
+    $builtBy     = $env:USERNAME
+    $gitBranchStr= "$gitBranch".Trim()
+    $compiledAgainst = New-Object PSObject
+    Add-Member -InputObject $compiledAgainst -NotePropertyName app    -NotePropertyValue $Item.App
+    Add-Member -InputObject $compiledAgainst -NotePropertyName site   -NotePropertyValue $Item.Site
+    Add-Member -InputObject $compiledAgainst -NotePropertyName env    -NotePropertyValue $Item.Env
+    Add-Member -InputObject $compiledAgainst -NotePropertyName server -NotePropertyValue $Item.Server
+    $markerDrift = New-Object PSObject
+    Add-Member -InputObject $markerDrift -NotePropertyName markerNoGit -NotePropertyValue $markerNoGit
+    Add-Member -InputObject $markerDrift -NotePropertyName gitNoMarker -NotePropertyValue $gitNoMarker
+    $manifestObj = New-Object PSObject
+    Add-Member -InputObject $manifestObj -NotePropertyName project         -NotePropertyValue $projTok
+    Add-Member -InputObject $manifestObj -NotePropertyName stamp           -NotePropertyValue $builtStamp
+    Add-Member -InputObject $manifestObj -NotePropertyName author          -NotePropertyValue $builtBy
+    Add-Member -InputObject $manifestObj -NotePropertyName oeVersion       -NotePropertyValue $Item.OEVersion
+    Add-Member -InputObject $manifestObj -NotePropertyName compiledAgainst -NotePropertyValue $compiledAgainst
+    Add-Member -InputObject $manifestObj -NotePropertyName full            -NotePropertyValue ([bool]$Full)
+    Add-Member -InputObject $manifestObj -NotePropertyName mode            -NotePropertyValue $(if ($Full -eq $true) { "full" } else { "changes" })
+    Add-Member -InputObject $manifestObj -NotePropertyName gitBranch       -NotePropertyValue $gitBranchStr
+    Add-Member -InputObject $manifestObj -NotePropertyName gitCommits      -NotePropertyValue @($gitCommits)
+    Add-Member -InputObject $manifestObj -NotePropertyName deltaDf         -NotePropertyValue @($dfNames)
+    Add-Member -InputObject $manifestObj -NotePropertyName changedSource   -NotePropertyValue @($changedManifest)
+    Add-Member -InputObject $manifestObj -NotePropertyName rcode           -NotePropertyValue @($rcodeManifest)
+    Add-Member -InputObject $manifestObj -NotePropertyName markerDrift     -NotePropertyValue $markerDrift
+    Add-Member -InputObject $manifestObj -NotePropertyName deployNotes     -NotePropertyValue "Load any df/ deltas FIRST (DBA-run, in listed order), then r-code + source. deploy.ps1 is dry-run by default; use -Execute."
     Set-Content -Path (Join-PathX $staging "manifest.json") -Value ($manifestObj | ConvertTo-Json -Depth 8) -Encoding ascii
 
     # Human-readable manifest.txt
     $mt = New-Object System.Collections.Generic.List[string]
     $mt.Add("OEAdmin -Package manifest"); $mt.Add("=========================")
     $mt.Add("Project        : $projTok")
-    $mt.Add("Built          : $($manifestObj.stamp)  by $($manifestObj.author)")
-    $mt.Add("Compiled for   : $($Item.App) / $($Item.Site) / $($Item.Env)  (OE $($Item.OEVersion), server $($Item.Server))")
+    $mt.Add("Built          : $builtStamp  by $builtBy")
+    $mt.Add("Compiled on    : $($Item.App) / $($Item.Site) / $($Item.Env)  (OE $($Item.OEVersion), server $($Item.Server))")
     $mt.Add("Mode           : " + $(if ($Full -eq $true) { "FULL (all r-code)" } else { "changes (dependency-aware)" }))
-    $mt.Add("Git branch     : $($manifestObj.gitBranch)")
+    $mt.Add("Git branch     : $gitBranchStr")
     $mt.Add("Git commits    : " + (@($gitCommits) -join ', '))
     $mt.Add("Delta DFs      : " + $(if ($dfNames.Count) { ($dfNames -join ', ') } else { "(none)" }))
     $mt.Add("")
@@ -3615,7 +3623,15 @@ if ([string]::IsNullOrWhiteSpace(`$TargetRoot)) {
 }
 `$manifestPath = Join-Path `$here 'manifest.json'
 if (-not (Test-Path `$manifestPath)) { Say "ERROR: manifest.json not found beside deploy.ps1." Red; exit 1 }
-`$manifest = Get-Content `$manifestPath -Raw | ConvertFrom-Json
+`$manifestRaw = (Get-Content `$manifestPath -Raw)
+if ([string]::IsNullOrWhiteSpace(`$manifestRaw)) {
+  Say "ERROR: manifest.json is empty - this bundle was built by a defective packager; rebuild the package." Red
+  exit 1
+}
+try { `$manifest = `$manifestRaw | ConvertFrom-Json } catch {
+  Say ("ERROR: manifest.json is not valid JSON ({0}); rebuild the package." -f `$_.Exception.Message) Red
+  exit 1
+}
 `$deployStamp = [DateTime]::Now.ToString('yyyy-MM-dd_HHmmss')
 
 # ---- Rollback -------------------------------------------------------------
@@ -3643,10 +3659,10 @@ if (`$dfs.Count -gt 0) {
   Say "" ; Say "This release carries `$(`$dfs.Count) schema delta .df file(s). They MUST be loaded FIRST," Yellow
   Say "in this order, into the target database BEFORE the code is deployed:" Yellow
   foreach (`$d in `$dfs) {
-    Say "   df\$d" Yellow
+    Say "   df\`$d" Yellow
     Say "     REM prodict/load_df.p takes an INPUT PARAMETER - RUN it from a driver (cannot use -param):" DarkGray
-    Say "     REM   _loaddf.p :  RUN prodict/load_df.p (INPUT `"`$here\df\$d`")." DarkGray
-    Say "     REM   `"%DLC%\bin\_progres`" -db <targetdb> -ld <ld> -1 -p _loaddf.p   (driver reads the .df path from an env var, e.g. DF_FILE=`$here\df\$d)" DarkGray
+    Say "     REM   _loaddf.p :  RUN prodict/load_df.p (INPUT `"`$here\df\`$d`")." DarkGray
+    Say "     REM   `"%DLC%\bin\_progres`" -db <targetdb> -ld <ld> -1 -p _loaddf.p   (driver reads the .df path from an env var, e.g. DF_FILE=`$here\df\`$d)" DarkGray
   }
   if (`$Execute) {
     `$ok = if (`$DfLoadConfirmed) { `$true } elseif ([Environment]::UserInteractive) {
