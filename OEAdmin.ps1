@@ -3472,16 +3472,24 @@ function Do-Package {
 
     $rcodeManifest = New-Object System.Collections.Generic.List[object]
     foreach ($u in $rcodeSet) {
-        $rFull = Join-PathX $srcRoot (($u -replace '/','\') + ".r")
+        # OpenEdge COMPILE ... SAVE writes r-code as the source basename with the
+        # source extension REPLACED by .r (foo.w -> foo.r), NOT appended (foo.w.r).
+        # Dependency-mode units carry the source extension (dir/foo.w); -Full units
+        # are already extensionless.  Strip any .p/.w/.cls/.t so both forms resolve
+        # to the real <base>.r.
+        $rBase = $u -replace '\.(p|w|cls|t)$',''
+        $rFull = Join-PathX $srcRoot (($rBase -replace '/','\') + ".r")
         if (-not (Test-Path -Path $rFull -PathType Leaf)) {
-            Write-Message ("  Package: expected r-code missing after clean compile: {0}.r - aborting (fail closed)." -f $u) -Fore Red
-            Remove-Item -Path $staging -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Message ("  Package: expected r-code missing after clean compile: {0}.r - aborting (fail closed)." -f $rBase) -Fore Red
+            Write-Message ("    (source unit: {0}; expected r-code beside source: {1})" -f $u, $rFull) -Fore Red
+            # Keep staging for review (holds compile/compile.log + the change-set).
+            Write-Message ("    (staging kept for review: {0})" -f $staging) -Fore DarkGray
             $script:OnError = $true; return
         }
-        $dest = Join-PathX $rStage (($u -replace '/','\') + ".r")
+        $dest = Join-PathX $rStage (($rBase -replace '/','\') + ".r")
         $null = New-Item -ItemType Directory -Path (Split-Path $dest -Parent) -Force -ErrorAction SilentlyContinue
         Copy-Item -Path $rFull -Destination $dest -Force
-        $rcodeManifest.Add([PSCustomObject]@{ path=($u + ".r"); sha256=(Get-FileHash -Path $rFull -Algorithm SHA256).Hash; bytes=(Get-Item -Path $rFull).Length })
+        $rcodeManifest.Add([PSCustomObject]@{ path=($rBase + ".r"); sha256=(Get-FileHash -Path $rFull -Algorithm SHA256).Hash; bytes=(Get-Item -Path $rFull).Length })
     }
 
     $dfNames = @()
