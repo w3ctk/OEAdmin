@@ -3509,12 +3509,20 @@ function Do-Package {
     }
     $gitBranch = (& git -C $srcRoot rev-parse --abbrev-ref HEAD 2>&1 | Select-Object -First 1)
 
-    $manifestObj = [PSCustomObject]@{
+    # Build the manifest as explicit ordered dictionaries and cast at the end.
+    # (A one-shot [PSCustomObject]@{...} literal with nested [PSCustomObject]
+    # literals as values can throw "Argument types do not match" in Windows
+    # PowerShell 5.1; building the maps first and converting is reliable.)
+    $markerNoGit = if ($markers) { @($markers.MarkerNoGit) } else { @() }
+    $gitNoMarker = if ($markers) { @($markers.GitNoMarker) } else { @() }
+    $compiledAgainst = [ordered]@{ app=$Item.App; site=$Item.Site; env=$Item.Env; server=$Item.Server }
+    $markerDrift     = [ordered]@{ markerNoGit=$markerNoGit; gitNoMarker=$gitNoMarker }
+    $manifestMap = [ordered]@{
         project        = $projTok
         stamp          = (Get-Date).ToString("o")
         author         = $env:USERNAME
         oeVersion      = $Item.OEVersion
-        compiledAgainst= [PSCustomObject]@{ app=$Item.App; site=$Item.Site; env=$Item.Env; server=$Item.Server }
+        compiledAgainst= [PSCustomObject]$compiledAgainst
         full           = [bool]$Full
         mode           = "full"
         gitBranch      = "$gitBranch".Trim()
@@ -3522,9 +3530,10 @@ function Do-Package {
         deltaDf        = @($dfNames)
         changedSource  = @($changedManifest)
         rcode          = @($rcodeManifest)
-        markerDrift    = [PSCustomObject]@{ markerNoGit=@($markers.MarkerNoGit); gitNoMarker=@($markers.GitNoMarker) }
+        markerDrift    = [PSCustomObject]$markerDrift
         deployNotes    = "Load any df/ deltas FIRST (DBA-run, in listed order), then r-code + source. deploy.ps1 is dry-run by default; use -Execute."
     }
+    $manifestObj = [PSCustomObject]$manifestMap
     Set-Content -Path (Join-PathX $staging "manifest.json") -Value ($manifestObj | ConvertTo-Json -Depth 8) -Encoding ascii
 
     # Human-readable manifest.txt
@@ -3544,10 +3553,10 @@ function Do-Package {
     $mt.Add("R-code shipped ($($rcodeManifest.Count)):")
     foreach ($r in $rcodeManifest) { $mt.Add(("  {0}  {1} bytes  sha256 {2}" -f $r.path, $r.bytes, $r.sha256)) }
     $mt.Add("")
-    if (@($markers.MarkerNoGit).Count -or @($markers.GitNoMarker).Count) {
+    if ($markerNoGit.Count -or $gitNoMarker.Count) {
         $mt.Add("Marker drift (advisory):")
-        foreach ($f in @($markers.MarkerNoGit)) { $mt.Add("  marker-no-git : $f") }
-        foreach ($f in @($markers.GitNoMarker)) { $mt.Add("  git-no-marker : $f") }
+        foreach ($f in $markerNoGit) { $mt.Add("  marker-no-git : $f") }
+        foreach ($f in $gitNoMarker) { $mt.Add("  git-no-marker : $f") }
         $mt.Add("")
     }
     $mt.Add("Deploy: $($manifestObj.deployNotes)")
@@ -3631,7 +3640,7 @@ if (`$Rollback) {
 # ---- Delta DF step (FIRST) - printed for the DBA, then awaited ------------
 `$dfs = @(`$manifest.deltaDf)
 if (`$dfs.Count -gt 0) {
-  Say "" ; Say "This release carries $(`$dfs.Count) schema delta .df file(s). They MUST be loaded FIRST," Yellow
+  Say "" ; Say "This release carries `$(`$dfs.Count) schema delta .df file(s). They MUST be loaded FIRST," Yellow
   Say "in this order, into the target database BEFORE the code is deployed:" Yellow
   foreach (`$d in `$dfs) {
     Say "   df\$d" Yellow
