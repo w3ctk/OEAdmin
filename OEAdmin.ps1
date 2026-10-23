@@ -3734,7 +3734,7 @@ foreach (`$sub in @('source','rcode')) {
 if (`$Execute) {
   Say "" ; Say "Deployed `$changed file(s). Backup set: `$backupSet" Green
   if (`$errors -gt 0) { Say "`$errors file(s) skipped due to backup-verify failure - review above." Red }
-  Say "Rollback with:  .\deploy.ps1 -Rollback -Stamp `$deployStamp -TargetRoot `"`$TargetRoot`" -Execute" Cyan
+  Say ("Rollback with:  .\deploy.ps1 -Rollback -Stamp {0} -TargetRoot '{1}' -Execute" -f `$deployStamp, `$TargetRoot) Cyan
 } else {
   Say "" ; Say "Preview only. Re-run with -Execute (and -TargetRoot) to deploy." Yellow
 }
