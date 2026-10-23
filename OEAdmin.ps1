@@ -2847,10 +2847,35 @@ function Do-Compile {
 
     $prev = $env:DLC; $env:DLC = $Item.DLC
     try {
-        $spArgs = @{ FilePath=$L.Exe; ArgumentList=$cargs; NoNewWindow=$true; Wait=$true; PassThru=$true;
+        # Launch WITHOUT -Wait so we can show a heartbeat while OECompiler.p runs.
+        # The ABL compile is a single blocking call we can't see into (its stdout is
+        # redirected to a file), so this is an elapsed-time "working on it" marquee,
+        # not a true percentage.  We poll the process + a periodic Write-Progress,
+        # then clear it once the compiler exits.
+        $spArgs = @{ FilePath=$L.Exe; ArgumentList=$cargs; NoNewWindow=$true; PassThru=$true;
                      RedirectStandardOutput=$outFile; RedirectStandardError=$errFile }
         if ($workDir) { $spArgs['WorkingDirectory'] = $workDir }
         $p = Start-Process @spArgs
+
+        Write-Message "  Compiling (this can take a while; see the log for per-file results)..." -Fore DarkGray
+        $swTimer = [System.Diagnostics.Stopwatch]::StartNew()
+        $spin = '|','/','-','\'; $si = 0
+        while (-not $p.HasExited) {
+            $el = $swTimer.Elapsed
+            $elapsedStr = "{0:D2}:{1:D2}" -f [int]$el.TotalMinutes, $el.Seconds
+            $logCount = 0
+            if (Test-Path -Path $logFile -PathType Leaf) {
+                $logCount = @(Get-Content -Path $logFile -ErrorAction SilentlyContinue).Count
+            }
+            Write-Progress -Activity ("Compiling {0}" -f (& $Label $Item)) `
+                -Status ("{0} working... elapsed {1}   log lines: {2}" -f $spin[$si % 4], $elapsedStr, $logCount) `
+                -PercentComplete -1
+            $si++
+            Start-Sleep -Milliseconds 400
+        }
+        $swTimer.Stop()
+        Write-Progress -Activity ("Compiling {0}" -f (& $Label $Item)) -Completed
+        Write-Message ("  Compile process finished in {0:D2}:{1:D2}." -f [int]$swTimer.Elapsed.TotalMinutes, $swTimer.Elapsed.Seconds) -Fore DarkGray
 
         # The driver writes compile.status ("ERRORS=<n>"); -1 or a missing file
         # means a setup/abort failure.  This - not $p.ExitCode (ABL QUIT has none) -
