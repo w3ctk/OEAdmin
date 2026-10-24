@@ -3946,10 +3946,30 @@ try { `$manifest = `$manifestRaw | ConvertFrom-Json } catch {
 }
 `$deployStamp = [DateTime]::Now.ToString('yyyy-MM-dd_HHmmss')
 
+# ---- Resolve the effective backup root ------------------------------------
+# The configured -PackageBackupDir (a share) may be unreachable on the target box -
+# an absent drive makes even Join-Path throw.  If it is not available, FALL BACK to
+# a backup folder under the target install (TargetRoot), which is always local and
+# present.  Both the deploy backup and -Rollback use this same resolved root so a
+# rollback reads from wherever the deploy wrote.
+function Test-BackupRootAvailable(`$root) {
+  if ([string]::IsNullOrWhiteSpace(`$root)) { return `$false }
+  try {
+    if (Test-Path -Path `$root) { return `$true }
+    `$qual = Split-Path -Path `$root -Qualifier -ErrorAction Stop
+    return (Test-Path -Path (`$qual + '\') -ErrorAction Stop)
+  } catch { return `$false }
+}
+`$effBackupRoot = `$PackageBackupDir
+if (-not (Test-BackupRootAvailable `$PackageBackupDir)) {
+  `$effBackupRoot = Join-Path `$TargetRoot 'oeadmin-backup'
+  Say ("WARNING: backup location '{0}' is not available; falling back to '{1}' (under the install)." -f `$PackageBackupDir, `$effBackupRoot) Yellow
+}
+
 # ---- Rollback -------------------------------------------------------------
 if (`$Rollback) {
   if ([string]::IsNullOrWhiteSpace(`$Stamp)) { Say "ERROR: -Rollback requires -Stamp <backup set>." Red; exit 1 }
-  `$bset = Join-Path (Join-Path `$PackageBackupDir 'oeadmin-deploy') `$Stamp
+  `$bset = Join-Path (Join-Path `$effBackupRoot 'oeadmin-deploy') `$Stamp
   if (-not (Test-Path `$bset)) { Say "ERROR: backup set not found: `$bset" Red; exit 1 }
   Say "Rolling back from `$bset -> `$TargetRoot" Cyan
   Get-ChildItem -Path `$bset -Recurse -File | ForEach-Object {
@@ -3994,7 +4014,7 @@ if (`$dfs.Count -gt 0) {
 #   * otherwise: the loose source\ + rcode\ trees are mirrored onto TargetRoot.
 # Either way the backup-before-overwrite + -Rollback mechanics are identical, so
 # a PL deploy rolls back to exactly the prior <App>.pl.
-`$backupSet = Join-Path (Join-Path `$PackageBackupDir 'oeadmin-deploy') `$deployStamp
+`$backupSet = Join-Path (Join-Path `$effBackupRoot 'oeadmin-deploy') `$deployStamp
 `$changed = 0; `$errors = 0
 
 # Local helper: back up (verify) then overwrite one file.  Returns `$true on a
