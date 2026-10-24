@@ -579,8 +579,10 @@ the zip root, so production can **override code via PROPATH**. This matters beca
 r-code inside a `.pl` resolves **relative to where the `.pl` sits on PROPATH**, so
 each PROPATH directory needs its own library. `-ShipPL` **implies `-Full`**. It is
 built with the OpenEdge `prolib` utility from the **same fresh full compile** that
-drives the XREF scan. Each library holds the compiled `.r` files **plus the `.wrx`**
-window-resource files that `.w` programs load at runtime.
+drives the XREF scan. A procedure library can only serve r-code (and images), **not
+`.wrx`**, so the libraries hold `.r` only. The `.wrx` window-resource files ship
+**loose** (in a `wrx/` folder) and deploy to their original dirs; a `.wrx` ships
+only when its matching `.r` ships.
 
 OEAdmin reads the `PROPATH=` line from the **same site INI the compile used** and
 keeps every entry at/under the compile root. Each becomes one library, named after

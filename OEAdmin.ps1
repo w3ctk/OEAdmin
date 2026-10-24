@@ -3571,10 +3571,10 @@ function Do-Package {
         foreach ($u in $rcodeSet) { Write-Message ("    rcode   {0}.r" -f $u) -Fore DarkGray }
         foreach ($d in $dfFiles)  { Write-Message ("    df      {0}" -f (Split-Path $d -Leaf)) -Fore DarkGray }
         if ($ShipPL -eq $true) {
-            Write-Message "    pl      -ShipPL (implies -Full): one procedure library per PROPATH entry under the compile root; deploy backs up/replaces ONLY the .pl file(s)." -Fore DarkGray
+            Write-Message "    pl      -ShipPL (implies -Full): one r-code procedure library per PROPATH entry; deploy replaces the .pl file(s) PLUS any sibling .wrx (loose, in their original dirs)." -Fore DarkGray
             $ppPreview = Get-PackagePropathDirs -IniPath $L.Ini -SrcRoot $srcRoot -App $Item.App
             foreach ($pp in @($ppPreview)) { Write-Message ("              {0}   <- {1}" -f $pp.PlName, $(if ($pp.Rel -eq "") { "<root>" } else { $pp.Rel })) -Fore DarkGray }
-            Write-Message "              (a PROPATH dir with no r-code is skipped; .r is owned by its NEAREST PROPATH entry)" -Fore DarkGray
+            Write-Message "              (a PROPATH dir with no r-code is skipped; .r owned by its NEAREST PROPATH entry; a .wrx ships only if its .r ships)" -Fore DarkGray
         }
         Write-Message ("  [DRYRUN] would write: {0}" -f $zipPath) -Fore DarkGray
         Remove-Item -Path $staging -Recurse -Force -ErrorAction SilentlyContinue
@@ -3608,6 +3608,12 @@ function Do-Package {
         $changedManifest.Add([ordered]@{ path=$f; sha256=$hash; bytes=$bytes; onDisk=$onDisk; revisionHistory=@($revLines) })
     }
 
+    # .wrx window-resource files ship LOOSE (a .pl cannot serve them) to their
+    # original app-root-relative dirs.  Rule: a .wrx ships only when its matching .r
+    # (same dir + basename, from a .w UI program) ships.  Populated below for the
+    # loose rcode\ path, and in the -ShipPL block for the PL path.
+    $wrxManifest = New-Object System.Collections.Generic.List[object]
+
     $rcodeManifest = New-Object System.Collections.Generic.List[object]
     foreach ($u in $rcodeSet) {
         # OpenEdge COMPILE ... SAVE writes r-code as the source basename with the
@@ -3628,6 +3634,16 @@ function Do-Package {
         $null = New-Item -ItemType Directory -Path (Split-Path $dest -Parent) -Force -ErrorAction SilentlyContinue
         Copy-Item -Path $rFull -Destination $dest -Force
         $rcodeManifest.Add([ordered]@{ path=($rBase + ".r"); sha256=(Get-FileHash -Path $rFull -Algorithm SHA256).Hash; bytes=(Get-Item -Path $rFull).Length })
+        # Ship the sibling .wrx (same base) LOOSE beside the r-code so the loose-file
+        # deploy mirrors it to TargetRoot in its original dir.  Only when the .r ships.
+        if (-not ($ShipPL -eq $true)) {
+            $wrxFull = Join-PathX $srcRoot (($rBase -replace '/','\') + ".wrx")
+            if (Test-Path -Path $wrxFull -PathType Leaf) {
+                $wdst = Join-PathX $rStage (($rBase -replace '/','\') + ".wrx")
+                Copy-Item -Path $wrxFull -Destination $wdst -Force
+                $wrxManifest.Add([ordered]@{ path=($rBase + ".wrx"); sha256=(Get-FileHash -Path $wrxFull -Algorithm SHA256).Hash; bytes=(Get-Item -Path $wrxFull).Length })
+            }
+        }
     }
 
     # ---- Optional per-PROPATH-entry procedure libraries (-ShipPL) -------------
@@ -3655,30 +3671,38 @@ function Do-Package {
             Write-Message ("    (staging kept for review: {0})" -f $staging) -Fore DarkGray
             $script:OnError = $true; return
         }
-        # Assign every shippable library member to its owning (deepest) PROPATH entry,
-        # so each file lands in exactly one library.  Walk DEEPEST-FIRST; a deeper
-        # entry claims its subtree before a shallower ancestor sees it.  Members are
-        # the compiled .r PLUS the .wrx window-resource files that .w programs load at
-        # runtime (a .wrx sits beside its .r, so it is owned by the same PROPATH entry).
-        $claimed = @{}   # full lowercase member path -> $true once owned
+        # Assign every .r to its owning (deepest) PROPATH entry, so each .r lands in
+        # exactly one library.  Walk DEEPEST-FIRST; a deeper entry claims its subtree
+        # before a shallower ancestor sees it.  A procedure library can only serve
+        # r-code (and images), NOT .wrx - so .wrx are NOT put in the .pl.  Instead,
+        # for each shipped .r we collect its sibling .wrx (same dir + basename, from a
+        # .w UI program) into $wrxShip to be deployed as LOOSE files to their original
+        # app-root-relative directories.  Rule: a .wrx ships only when its .r ships.
+        $srcN = $srcRoot.TrimEnd('\')
+        $claimed = @{}   # full lowercase .r path -> $true once owned
+        $wrxShip = New-Object System.Collections.Generic.List[string]   # app-root-relative .wrx paths
         foreach ($pp in @($ppDirs)) {
             $ppDirN = $pp.Dir.TrimEnd('\')
-            $owned = New-Object System.Collections.Generic.List[string]   # paths relative to $ppDirN
-            foreach ($ri in (Get-ChildItem -Path $ppDirN -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -eq '.r' -or $_.Extension -eq '.wrx' })) {
+            $owned = New-Object System.Collections.Generic.List[string]   # .r paths relative to $ppDirN
+            foreach ($ri in (Get-ChildItem -Path $ppDirN -Recurse -File -Filter *.r -ErrorAction SilentlyContinue)) {
                 $full = $ri.FullName
                 $fl = $full.ToLower()
                 if ($claimed.ContainsKey($fl)) { continue }        # already owned by a deeper entry
                 $claimed[$fl] = $true
                 $owned.Add($full.Substring($ppDirN.Length).TrimStart('\'))   # relative to THIS .pl's dir
+                $wrxFull = [System.IO.Path]::ChangeExtension($full, '.wrx')
+                if (Test-Path -Path $wrxFull -PathType Leaf) {
+                    $wrxShip.Add($wrxFull.Substring($srcN.Length).TrimStart('\'))   # app-root-relative
+                }
             }
-            if ($owned.Count -eq 0) { continue }                   # skip empties (no .r or .wrx)
+            if ($owned.Count -eq 0) { continue }                   # skip empties (no .r)
 
             $plName  = $pp.PlName
             $plStage = Join-PathX $staging $plName                 # ZIP root
             $plBuild = Join-PathX $ppDirN $plName                  # built in-place in the PROPATH dir, then moved
             if (Test-Path -Path $plBuild) { Remove-Item -Path $plBuild -Force -ErrorAction SilentlyContinue }
 
-            Write-Message ("  -ShipPL: building {0} from {1} member(s) (.r + .wrx) under {2}..." -f $plName, $owned.Count, $(if ($pp.Rel -eq "") { "<root>" } else { $pp.Rel })) -Fore Cyan
+            Write-Message ("  -ShipPL: building {0} from {1} r-code file(s) under {2}..." -f $plName, $owned.Count, $(if ($pp.Rel -eq "") { "<root>" } else { $pp.Rel })) -Fore Cyan
             # Run prolib with CWD = THIS PROPATH dir so members store relative to it.
             # -create precedes -add; add in batches to stay under the OS cmd-line limit.
             $plOk = $true; $plErr = ""
@@ -3721,11 +3745,24 @@ function Do-Package {
             Write-Message ("  -ShipPL: {0} built ({1} files, {2} bytes)" -f $plName, $owned.Count, (Get-Item -Path $plStage).Length) -Fore Green
         }
         if ($plInfoList.Count -eq 0) {
-            Write-Message "  Package: -ShipPL produced no libraries (no PROPATH entry under the compile root held .r/.wrx) - aborting (fail closed)." -Fore Red
+            Write-Message "  Package: -ShipPL produced no libraries (no PROPATH entry under the compile root held r-code) - aborting (fail closed)." -Fore Red
             Write-Message ("    (staging kept for review: {0})" -f $staging) -Fore DarkGray
             $script:OnError = $true; return
         }
         Write-Message ("  -ShipPL: {0} procedure library(ies) built." -f $plInfoList.Count) -Fore Green
+
+        # Sibling .wrx files ship LOOSE (a .pl cannot serve them) into a wrx\ folder
+        # that mirrors their app-root-relative path; deploy.ps1 (PL mode) lays them
+        # down at TargetRoot in their original dirs.
+        foreach ($wrel in @($wrxShip)) {
+            $wsrc = Join-PathX $srcRoot ($wrel -replace '/','\')
+            if (-not (Test-Path -Path $wsrc -PathType Leaf)) { continue }
+            $wdst = Join-PathX (Join-PathX $staging "wrx") ($wrel -replace '/','\')
+            $null = New-Item -ItemType Directory -Path (Split-Path $wdst -Parent) -Force -ErrorAction SilentlyContinue
+            Copy-Item -Path $wsrc -Destination $wdst -Force
+            $wrxManifest.Add([ordered]@{ path=($wrel -replace '\\','/'); sha256=(Get-FileHash -Path $wsrc -Algorithm SHA256).Hash; bytes=(Get-Item -Path $wsrc).Length })
+        }
+        if ($wrxManifest.Count -gt 0) { Write-Message ("  -ShipPL: {0} .wrx file(s) staged for loose deploy." -f $wrxManifest.Count) -Fore Green }
     }
 
     $dfNames = @()
@@ -3757,7 +3794,7 @@ function Do-Package {
     $gitBranchStr= "$gitBranch".Trim()
     $deployNotesText = if ($plInfoList.Count -gt 0) {
         $plNamesJoined = (@($plInfoList | ForEach-Object { $_.name }) -join ', ')
-        "PL mode (-ShipPL): deploy.ps1 backs up + replaces ONLY the procedure library file(s) [$plNamesJoined] at TargetRoot (one per PROPATH entry). source/ and rcode/ ride along as documentation and are NOT deployed. Load any df/ deltas FIRST (DBA-run, in listed order). Dry-run by default; use -Execute."
+        "PL mode (-ShipPL): deploy.ps1 deploys the procedure library file(s) [$plNamesJoined] at TargetRoot (one per PROPATH entry) PLUS any .wrx under wrx/ to their original dirs (a .pl cannot serve .wrx). source/ and rcode/ ride along as documentation and are NOT deployed. Load any df/ deltas FIRST (DBA-run, in listed order). Dry-run by default; use -Execute."
     } else {
         "Load any df/ deltas FIRST (DBA-run, in listed order), then r-code + source. deploy.ps1 is dry-run by default; use -Execute."
     }
@@ -3835,6 +3872,15 @@ function Do-Package {
                      ', "units": '  + ([long]$pl.units) + ' }')
     }
     $jLines.Add('  "shipPL": [' + ($plItems -join ', ') + '],')
+    # wrx: array of { path, sha256, bytes } - loose .wrx files (PL mode: under wrx/ in
+    # the bundle; loose mode: under rcode/).  deploy lays them at their app-rel path.
+    $wxItems = @()
+    foreach ($w in $wrxManifest) {
+        $wxItems += ('{ "path": ' + (ConvertTo-JsonStr ([string]$w.path)) +
+                     ', "sha256": ' + (ConvertTo-JsonStr ([string]$w.sha256)) +
+                     ', "bytes": '  + ([long]$w.bytes) + ' }')
+    }
+    $jLines.Add('  "wrx": [' + ($wxItems -join ', ') + '],')
     $jLines.Add('  "markerDrift": { "markerNoGit": ' + (ConvertTo-JsonStrArray $markerNoGit) +
                 ', "gitNoMarker": ' + (ConvertTo-JsonStrArray $gitNoMarker) + ' },')
     $jLines.Add('  "deployNotes": ' + (ConvertTo-JsonStr $deployNotesText))
@@ -3869,8 +3915,13 @@ function Do-Package {
     foreach ($r in $rcodeManifest) { $mt.Add(("  {0}  {1} bytes  sha256 {2}" -f $r.path, $r.bytes, $r.sha256)) }
     $mt.Add("")
     if ($plInfoList.Count -gt 0) {
-        $mt.Add("Procedure libraries (-ShipPL) - the ONLY files deploy.ps1 backs up/replaces (one per PROPATH entry):")
+        $mt.Add("Procedure libraries (-ShipPL) - deploy.ps1 backs up/replaces these (one per PROPATH entry):")
         foreach ($pl in $plInfoList) { $mt.Add(("  {0}  (PROPATH dir {1})  {2} bytes  {3} file(s)  sha256 {4}" -f $pl.name, $pl.dir, $pl.bytes, $pl.units, $pl.sha256)) }
+        $mt.Add("")
+    }
+    if ($wrxManifest.Count -gt 0) {
+        $mt.Add("Loose .wrx files ($($wrxManifest.Count)) - deployed to their original dirs (a .pl cannot serve .wrx):")
+        foreach ($w in $wrxManifest) { $mt.Add(("  {0}  {1} bytes  sha256 {2}" -f $w.path, $w.bytes, $w.sha256)) }
         $mt.Add("")
     }
     if ($markerNoGit.Count -or $gitNoMarker.Count) {
@@ -4044,13 +4095,22 @@ if (`$pls.Count -gt 0) {
   # PL mode: the ONLY files deployed are the procedure libraries at the bundle root
   # (one per PROPATH entry).  Each <name>.pl lands flat at TargetRoot\<name>; the
   # site INI's PROPATH lists them in search order.  source\ + rcode\ are docs only.
-  Say "" ; Say ("PL mode: {0} procedure library(ies) are the only files deployed (source\ + rcode\ are documentation only)." -f `$pls.Count) Cyan
+  Say "" ; Say ("PL mode: {0} procedure library(ies) + any loose .wrx are deployed (source\ + rcode\ are documentation only)." -f `$pls.Count) Cyan
   foreach (`$pl in `$pls) {
     `$plSrc = Join-Path `$here `$pl.name
     if (-not (Test-Path `$plSrc)) {
       Say ("ERROR: manifest lists shipPL {0} but that file is not at the bundle root. Rebuild the package." -f `$pl.name) Red; exit 1
     }
     if (Deploy-OneFile `$plSrc `$pl.name) { `$changed++ } else { `$errors++ }
+  }
+  # A procedure library cannot serve .wrx, so .wrx ship LOOSE under wrx\ in the
+  # bundle and deploy to their original app-root-relative dirs (bin\*.wrx, etc.).
+  `$wrxBase = Join-Path `$here 'wrx'
+  if (Test-Path `$wrxBase) {
+    Get-ChildItem -Path `$wrxBase -Recurse -File | ForEach-Object {
+      `$appRel = `$_.FullName.Substring(`$wrxBase.Length).TrimStart('\','/')
+      if (Deploy-OneFile `$_.FullName `$appRel) { `$changed++ } else { `$errors++ }
+    }
   }
 } else {
   # Loose-file mode: mirror source\ + rcode\ onto TargetRoot.
